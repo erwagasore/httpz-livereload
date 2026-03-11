@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0] — 2026-03-12
+
+### Features
+
+- Configurable `retry_ms` for the EventSource reconnection interval
+  (default: 200ms, previously hardcoded at 2000ms). Lower values mean
+  faster browser reload after a server restart.
+
 ## [0.1.0] — 2026-03-11
 
 Initial release.

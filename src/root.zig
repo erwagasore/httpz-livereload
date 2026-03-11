@@ -35,14 +35,21 @@ pub const Config = struct {
 
     /// Binary polling interval (nanoseconds).
     watch_interval_ns: u64 = 500 * std.time.ns_per_ms,
+
+    /// EventSource reconnection interval (milliseconds). The browser
+    /// waits this long before reconnecting after the SSE connection
+    /// drops. Lower values mean faster reload on restart, but more
+    /// reconnect attempts while the server is down.
+    retry_ms: u16 = 200,
 };
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-// Immutable after init. inject_snippet lives on the server arena;
+// Immutable after init. All slices live on the server arena;
 // path points into the Config literal or the server arena.
 path: []const u8,
 inject_snippet: []const u8,
+sse_init_msg: []const u8,
 
 // Binary watcher — immutable after init. Safe to read from the watcher
 // thread because Thread.spawn provides a happens-before guarantee.
@@ -65,13 +72,19 @@ generation: u64,
 pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     const arena = mc.arena;
 
-    // Pre-format the injected script. The only runtime value is the
+    // Pre-format the injected script. The only runtime values are the
     // configurable SSE path — everything else is a comptime literal.
     const inject_snippet = try std.fmt.allocPrint(arena,
         \\<script>(function(){{var ok=false,s=new EventSource("{s}");
         \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
         \\s.addEventListener("reload",function(){{s.close();location.reload()}})}})()</script>
     , .{config.path});
+
+    // Pre-format the SSE init message with the configured retry interval.
+    const sse_init_msg = try std.fmt.allocPrint(arena,
+        "retry:{d}\nevent:init\ndata:\n\n",
+        .{config.retry_ms},
+    );
 
     // Resolve executable path and initial mtime.
     var exe_path: ?[:0]const u8 = null;
@@ -87,6 +100,7 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     return .{
         .path = config.path,
         .inject_snippet = inject_snippet,
+        .sse_init_msg = sse_init_msg,
         .exe_path = exe_path,
         .exe_mtime = exe_mtime,
         .watch_interval_ns = config.watch_interval_ns,
@@ -155,7 +169,6 @@ pub fn execute(self: *LiveReload, req: *httpz.Request, res: *httpz.Response, exe
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
 
-const sse_init = "retry:2000\nevent:init\ndata:\n\n";
 const sse_reload = "event:reload\ndata:\n\n";
 
 fn serveSSE(self: *LiveReload, res: *httpz.Response) !void {
@@ -163,9 +176,8 @@ fn serveSSE(self: *LiveReload, res: *httpz.Response) !void {
 }
 
 /// Runs in a detached thread — no allocator available.
-/// Writes only comptime literals.
 fn sseWriter(self: *LiveReload, stream: std.net.Stream) void {
-    stream.writeAll(sse_init) catch return;
+    stream.writeAll(self.sse_init_msg) catch return;
 
     // Park until a reload is signalled.
     {
@@ -237,6 +249,7 @@ fn testInstance() LiveReload {
     return .{
         .path = "/_livereload",
         .inject_snippet = "<script>lr()</script>",
+        .sse_init_msg = "retry:200\nevent:init\ndata:\n\n",
         .exe_path = null,
         .exe_mtime = 0,
         .watch_interval_ns = 0,
