@@ -2,7 +2,7 @@
 //!
 //! Injects a small script into HTML responses that opens an SSE connection
 //! to the server. The connection is held open for the lifetime of the page.
-//! A reload is triggered in two situations:
+//! A reload is triggered in three situations:
 //!
 //! - **Reconnection** — the SSE connection only drops when the server
 //!   process dies. The browser reconnects, receives a new `init` event,
@@ -11,6 +11,11 @@
 //! - **Explicit signal** — calling `reload()` pushes an SSE `reload`
 //!   event to every connected browser (e.g. a content file changed on
 //!   disk and the running server already serves the new version).
+//!
+//! - **Directory watch** — calling `watchDir()` starts a background
+//!   thread that polls a directory tree for file changes. On change,
+//!   an optional callback is invoked (e.g. to re-parse content), then
+//!   all connected browsers are signalled to reload.
 //!
 //! A background thread can optionally watch the server binary on disk.
 //! When its mtime changes (e.g. `zig build --watch` rebuilt it), the
@@ -145,6 +150,89 @@ pub fn reload(self: *LiveReload) void {
 /// ```
 pub fn from(mw: anytype) *LiveReload {
     return @ptrCast(@alignCast(mw.ptr));
+}
+
+// ── Directory watching ───────────────────────────────────────────────────────
+
+pub const WatchDirOpts = struct {
+    /// Poll interval in nanoseconds. Default 100ms.
+    poll_ns: u64 = 100 * std.time.ns_per_ms,
+
+    /// Optional callback invoked when a change is detected, *before*
+    /// signalling browsers to reload. Return an error to skip the
+    /// reload for this change (e.g. if re-parsing content failed).
+    on_change: ?*const fn (?*anyopaque) anyerror!void = null,
+
+    /// Opaque context pointer passed to `on_change`.
+    ctx: ?*anyopaque = null,
+};
+
+/// Watch a directory tree for file changes. When a modification is
+/// detected, the optional `on_change` callback is invoked first, then
+/// all connected browsers are signalled to reload.
+///
+/// Can be called multiple times for different directories. Each call
+/// spawns a lightweight background thread.
+///
+/// ```zig
+/// const lr = LiveReload.from(mw);
+/// lr.watchDir("content", .{
+///     .poll_ns = 50 * std.time.ns_per_ms,
+///     .on_change = &MyApp.reloadContent,
+///     .ctx = @ptrCast(app),
+/// });
+/// lr.watchDir("static", .{});
+/// ```
+pub fn watchDir(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
+    _ = std.Thread.spawn(.{}, watchDirLoop, .{ self, dir, opts }) catch |err| {
+        log.warn("could not start directory watcher for '{s}': {}", .{ dir, err });
+    };
+}
+
+fn watchDirLoop(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
+    var prev = dirMtime(dir);
+    while (true) {
+        std.Thread.sleep(opts.poll_ns);
+        const curr = dirMtime(dir);
+        if (curr != prev) {
+            prev = curr;
+            if (opts.on_change) |cb| {
+                cb(opts.ctx) catch |err| {
+                    log.warn("watch callback error for '{s}': {}", .{ dir, err });
+                    continue;
+                };
+            }
+            log.info("change detected in '{s}' — reloading browsers", .{dir});
+            self.reload();
+        }
+    }
+}
+
+/// Return the maximum mtime across all files in a directory tree.
+fn dirMtime(path: []const u8) i128 {
+    var best: i128 = 0;
+    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    walkDirMtime(dir, &best);
+    return best;
+}
+
+fn walkDirMtime(dir: std.fs.Dir, best: *i128) void {
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        switch (entry.kind) {
+            .file => {
+                const stat = dir.statFile(entry.name) catch continue;
+                if (stat.mtime > best.*) best.* = stat.mtime;
+            },
+            .directory => {
+                var sub = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close();
+                walkDirMtime(sub, best);
+            },
+            else => {},
+        }
+    }
 }
 
 // ── Middleware execute ────────────────────────────────────────────────────────
@@ -333,4 +421,21 @@ test "execute: HTML responses get script injected" {
 
     try testing.expect(exec.called);
     try testing.expectEqualStrings("<h1>hi</h1><script>lr()</script>", ht.res.body);
+}
+
+test "dirMtime: returns 0 for non-existent path" {
+    try testing.expectEqual(@as(i128, 0), dirMtime("__nonexistent_dir__"));
+}
+
+test "dirMtime: returns non-zero for existing directory with files" {
+    // Use src/ which always has root.zig
+    const mtime = dirMtime("src");
+    try testing.expect(mtime > 0);
+}
+
+test "WatchDirOpts: defaults" {
+    const opts = WatchDirOpts{};
+    try testing.expectEqual(@as(u64, 100 * std.time.ns_per_ms), opts.poll_ns);
+    try testing.expect(opts.on_change == null);
+    try testing.expect(opts.ctx == null);
 }

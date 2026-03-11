@@ -53,6 +53,34 @@ while zig-out/bin/server; do sleep 0.1; done
 watchexec -r -e zig,md,css,js -- zig build run
 ```
 
+### Directory watching
+
+Watch content or static directories for changes — the middleware detects
+file modifications and reloads all connected browsers automatically:
+
+```zig
+const livereload = try server.middleware(LiveReload, .{ .watch = false });
+const lr = LiveReload.from(livereload);
+
+// Static files: just reload browsers on change
+lr.watchDir("static", .{});
+
+// Content files: run a callback before reloading (e.g. re-parse markdown)
+lr.watchDir("content", .{
+    .poll_ns = 50 * std.time.ns_per_ms,  // check every 50ms
+    .on_change = &struct {
+        fn f(ctx: ?*anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx.?));
+            try app.reloadContent();
+        }
+    }.f,
+    .ctx = @ptrCast(app),
+});
+```
+
+Each call spawns a lightweight background thread. Default poll interval
+is 100ms.
+
 ### Manual reload
 
 Trigger browser reloads from application code without restarting:

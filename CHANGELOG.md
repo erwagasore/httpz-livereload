@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.0] — 2026-03-12
+
+### Features
+
+- **Directory watching** — new `watchDir()` method lets you watch
+  directory trees for file changes. On change, an optional callback is
+  invoked (e.g. to re-parse content), then all connected browsers are
+  signalled to reload. Default poll interval is 100ms (configurable via
+  `poll_ns`). Each call spawns a lightweight background thread.
+
 ## [0.3.0] — 2026-03-12
 
 ### Features
