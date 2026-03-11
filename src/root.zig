@@ -1,0 +1,316 @@
+//! Browser reload middleware for httpz.
+//!
+//! Injects a small script into HTML responses that opens an SSE connection
+//! to the server. The connection is held open for the lifetime of the page.
+//! A reload is triggered in two situations:
+//!
+//! - **Reconnection** — the SSE connection only drops when the server
+//!   process dies. The browser reconnects, receives a new `init` event,
+//!   and reloads.
+//!
+//! - **Explicit signal** — calling `reload()` pushes an SSE `reload`
+//!   event to every connected browser (e.g. a content file changed on
+//!   disk and the running server already serves the new version).
+//!
+//! A background thread can optionally watch the server binary on disk.
+//! When its mtime changes (e.g. `zig build --watch` rebuilt it), the
+//! middleware signals browsers and exits the process so a wrapper can
+//! restart it with new code.
+
+const std = @import("std");
+const httpz = @import("httpz");
+
+const log = std.log.scoped(.livereload);
+const LiveReload = @This();
+
+// ── Config ───────────────────────────────────────────────────────────────────
+
+pub const Config = struct {
+    /// SSE endpoint path.
+    path: []const u8 = "/_livereload",
+
+    /// Watch the server binary for changes. On change, signal browsers
+    /// and exit(0) so a restart wrapper can relaunch with new code.
+    watch: bool = true,
+
+    /// Binary polling interval (nanoseconds).
+    watch_interval_ns: u64 = 500 * std.time.ns_per_ms,
+};
+
+// ── State ────────────────────────────────────────────────────────────────────
+
+// Immutable after init. inject_snippet lives on the server arena;
+// path points into the Config literal or the server arena.
+path: []const u8,
+inject_snippet: []const u8,
+
+// Binary watcher — immutable after init. Safe to read from the watcher
+// thread because Thread.spawn provides a happens-before guarantee.
+exe_path: ?[:0]const u8,
+exe_mtime: i128,
+watch_interval_ns: u64,
+
+// Lazy-spawn flag. The watcher can't be started in init() because httpz's
+// middleware() copies the returned value into the arena — `self` isn't a
+// stable pointer until execute() is called on the arena-allocated copy.
+watcher_spawned: std.atomic.Value(bool),
+
+// Mutable shared state guarded by mu.
+mu: std.Thread.Mutex,
+cond: std.Thread.Condition,
+generation: u64,
+
+// ── Init / deinit ────────────────────────────────────────────────────────────
+
+pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
+    const arena = mc.arena;
+
+    // Pre-format the injected script. The only runtime value is the
+    // configurable SSE path — everything else is a comptime literal.
+    const inject_snippet = try std.fmt.allocPrint(arena,
+        \\<script>(function(){{var ok=false,s=new EventSource("{s}");
+        \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
+        \\s.addEventListener("reload",function(){{s.close();location.reload()}})}})()</script>
+    , .{config.path});
+
+    // Resolve executable path and initial mtime.
+    var exe_path: ?[:0]const u8 = null;
+    var exe_mtime: i128 = 0;
+    if (config.watch) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExePath(&buf)) |p| {
+            exe_path = try arena.dupeZ(u8, p);
+            exe_mtime = fileMtime(exe_path.?);
+        } else |_| {}
+    }
+
+    return .{
+        .path = config.path,
+        .inject_snippet = inject_snippet,
+        .exe_path = exe_path,
+        .exe_mtime = exe_mtime,
+        .watch_interval_ns = config.watch_interval_ns,
+        .watcher_spawned = std.atomic.Value(bool).init(false),
+        .mu = .{},
+        .cond = .{},
+        .generation = 0,
+    };
+}
+
+/// Nothing to clean up — all memory is on the server arena.
+pub fn deinit(_: *const LiveReload) void {}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/// Signal all connected browsers to reload.
+///
+/// Use for cases that don't involve a server restart, e.g. a content
+/// file changed on disk and the running server already serves the new
+/// version.
+pub fn reload(self: *LiveReload) void {
+    self.mu.lock();
+    defer self.mu.unlock();
+    self.generation +%= 1;
+    self.cond.broadcast();
+}
+
+/// Extract the concrete `*LiveReload` from a type-erased `httpz.Middleware`
+/// handle returned by `server.middleware()`.
+///
+/// ```zig
+/// const mw = try server.middleware(LiveReload, .{});
+/// const lr = LiveReload.from(mw);
+/// lr.reload(); // manual trigger
+/// ```
+pub fn from(mw: anytype) *LiveReload {
+    return @ptrCast(@alignCast(mw.ptr));
+}
+
+// ── Middleware execute ────────────────────────────────────────────────────────
+
+// Takes *LiveReload (not *const) because Mutex.lock and atomic.cmpxchgStrong
+// require mutable pointers in Zig. This is the standard pattern for middleware
+// with interior-mutable state — httpz dispatches through *M which satisfies this.
+pub fn execute(self: *LiveReload, req: *httpz.Request, res: *httpz.Response, executor: anytype) !void {
+    // Lazily spawn the binary watcher on first request. At this point
+    // `self` is the stable, arena-allocated pointer.
+    if (self.exe_path != null and
+        self.watcher_spawned.cmpxchgStrong(false, true, .release, .monotonic) == null)
+    {
+        _ = std.Thread.spawn(.{}, watchBinaryLoop, .{self}) catch {};
+    }
+
+    // SSE endpoint — respond and short-circuit.
+    if (std.mem.eql(u8, req.url.path, self.path)) {
+        return self.serveSSE(res);
+    }
+
+    // Normal path — run the handler chain, then inject if HTML.
+    try executor.next();
+
+    if (res.content_type == .HTML) {
+        self.injectScript(res);
+    }
+}
+
+// ── SSE ──────────────────────────────────────────────────────────────────────
+
+const sse_init = "retry:2000\nevent:init\ndata:\n\n";
+const sse_reload = "event:reload\ndata:\n\n";
+
+fn serveSSE(self: *LiveReload, res: *httpz.Response) !void {
+    try res.startEventStream(self, sseWriter);
+}
+
+/// Runs in a detached thread — no allocator available.
+/// Writes only comptime literals.
+fn sseWriter(self: *LiveReload, stream: std.net.Stream) void {
+    stream.writeAll(sse_init) catch return;
+
+    // Park until a reload is signalled.
+    {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const gen = self.generation;
+        while (self.generation == gen) {
+            self.cond.wait(&self.mu);
+        }
+    }
+
+    stream.writeAll(sse_reload) catch {};
+}
+
+// ── Script injection ─────────────────────────────────────────────────────────
+
+fn injectScript(self: *const LiveReload, res: *httpz.Response) void {
+    if (res.body.len > 0) {
+        // Handler set body directly — allocate on the per-request arena.
+        res.body = std.fmt.allocPrint(
+            res.arena,
+            "{s}{s}",
+            .{ res.body, self.inject_snippet },
+        ) catch |err| {
+            log.warn("failed to inject livereload script: {}", .{err});
+            return;
+        };
+    } else {
+        // Handler used the writer API — append there.
+        res.writer().writeAll(self.inject_snippet) catch |err| {
+            log.warn("failed to inject livereload script: {}", .{err});
+        };
+    }
+}
+
+// ── Binary watcher ───────────────────────────────────────────────────────────
+
+fn watchBinaryLoop(self: *LiveReload) void {
+    const path = self.exe_path orelse return;
+    while (true) {
+        std.Thread.sleep(self.watch_interval_ns);
+        const mtime = fileMtime(path);
+        if (mtime != self.exe_mtime) {
+            self.reload();
+            // Let SSE threads flush the reload event before exit.
+            std.Thread.sleep(300 * std.time.ns_per_ms);
+            std.process.exit(0);
+        }
+    }
+}
+
+fn fileMtime(path: [:0]const u8) i128 {
+    const stat = std.fs.cwd().statFile(path) catch return 0;
+    return stat.mtime;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+const NoopExecutor = struct {
+    called: bool = false,
+    pub fn next(self: *NoopExecutor) !void {
+        self.called = true;
+    }
+};
+
+fn testInstance() LiveReload {
+    return .{
+        .path = "/_livereload",
+        .inject_snippet = "<script>lr()</script>",
+        .exe_path = null,
+        .exe_mtime = 0,
+        .watch_interval_ns = 0,
+        .watcher_spawned = std.atomic.Value(bool).init(false),
+        .mu = .{},
+        .cond = .{},
+        .generation = 0,
+    };
+}
+
+test "reload increments generation" {
+    var lr = testInstance();
+    try testing.expectEqual(@as(u64, 0), lr.generation);
+    lr.reload();
+    try testing.expectEqual(@as(u64, 1), lr.generation);
+    lr.reload();
+    try testing.expectEqual(@as(u64, 2), lr.generation);
+}
+
+test "injectScript: appends to body" {
+    var lr = testInstance();
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+
+    ht.res.content_type = .HTML;
+    ht.res.body = "<html></html>";
+
+    lr.injectScript(ht.res);
+
+    try testing.expectEqualStrings("<html></html><script>lr()</script>", ht.res.body);
+}
+
+test "injectScript: appends to writer when body is empty" {
+    var lr = testInstance();
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+
+    ht.res.content_type = .HTML;
+    try ht.res.writer().writeAll("<html></html>");
+
+    lr.injectScript(ht.res);
+
+    const buffered = ht.res.writer().buffered();
+    try testing.expectEqualStrings("<html></html><script>lr()</script>", buffered);
+}
+
+test "execute: non-HTML responses pass through" {
+    var lr = testInstance();
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.url("/");
+
+    ht.res.content_type = .JSON;
+    ht.res.body = "{\"ok\":true}";
+
+    var exec = NoopExecutor{};
+    try lr.execute(ht.req, ht.res, &exec);
+
+    try testing.expect(exec.called);
+    try testing.expectEqualStrings("{\"ok\":true}", ht.res.body);
+}
+
+test "execute: HTML responses get script injected" {
+    var lr = testInstance();
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.url("/");
+
+    ht.res.content_type = .HTML;
+    ht.res.body = "<h1>hi</h1>";
+
+    var exec = NoopExecutor{};
+    try lr.execute(ht.req, ht.res, &exec);
+
+    try testing.expect(exec.called);
+    try testing.expectEqualStrings("<h1>hi</h1><script>lr()</script>", ht.res.body);
+}
