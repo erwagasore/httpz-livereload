@@ -36,11 +36,12 @@ pub const Config = struct {
     /// Binary polling interval (nanoseconds).
     watch_interval_ns: u64 = 500 * std.time.ns_per_ms,
 
-    /// EventSource reconnection interval (milliseconds). The browser
-    /// waits this long before reconnecting after the SSE connection
-    /// drops. Lower values mean faster reload on restart, but more
-    /// reconnect attempts while the server is down.
-    retry_ms: u16 = 200,
+    /// Reconnection interval (milliseconds). Controls both the SSE
+    /// `retry:` directive and the client-side reconnect delay. Lower
+    /// values mean faster reload after a restart at the cost of a few
+    /// extra TCP attempts while the server is down (negligible on
+    /// localhost).
+    retry_ms: u16 = 50,
 };
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -72,13 +73,19 @@ generation: u64,
 pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     const arena = mc.arena;
 
-    // Pre-format the injected script. The only runtime values are the
-    // configurable SSE path — everything else is a comptime literal.
+    // Pre-format the injected script.
+    //
+    // On disconnect the script bypasses EventSource's built-in retry
+    // (which waits the full `retry` interval) and instead re-creates
+    // the EventSource after a short delay for snappier reconnects.
     const inject_snippet = try std.fmt.allocPrint(arena,
-        \\<script>(function(){{var ok=false,s=new EventSource("{s}");
+        \\<script>(function(){{var ok=false,t,R={d};
+        \\function c(){{var s=new EventSource("{s}");
         \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
-        \\s.addEventListener("reload",function(){{s.close();location.reload()}})}})()</script>
-    , .{config.path});
+        \\s.addEventListener("reload",function(){{s.close();location.reload()}});
+        \\s.addEventListener("error",function(){{s.close();clearTimeout(t);t=setTimeout(c,R)}})}}
+        \\c()}})()</script>
+    , .{ config.retry_ms, config.path });
 
     // Pre-format the SSE init message with the configured retry interval.
     const sse_init_msg = try std.fmt.allocPrint(arena,
@@ -249,7 +256,7 @@ fn testInstance() LiveReload {
     return .{
         .path = "/_livereload",
         .inject_snippet = "<script>lr()</script>",
-        .sse_init_msg = "retry:200\nevent:init\ndata:\n\n",
+        .sse_init_msg = "retry:50\nevent:init\ndata:\n\n",
         .exe_path = null,
         .exe_mtime = 0,
         .watch_interval_ns = 0,

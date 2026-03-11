@@ -72,7 +72,7 @@ const livereload = try server.middleware(LiveReload, .{
     .path = "/_livereload",            // SSE endpoint path
     .watch = true,                     // watch own binary for changes
     .watch_interval_ns = 500_000_000,  // check every 500ms
-    .retry_ms = 200,                   // browser reconnect interval (ms)
+    .retry_ms = 50,                    // browser reconnect interval (ms)
 });
 ```
 
