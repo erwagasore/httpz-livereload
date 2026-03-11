@@ -18,7 +18,7 @@ Inspired by [tower-livereload](https://github.com/leotaku/tower-livereload).
      disk. When it changes, all browsers are signalled to reload and the
      process exits so it can restart with new code.
 4. For explicit reloads without restart (e.g. content file changes), call
-   `reloader.reload()` from application code.
+   `reload()` from application code.
 
 ## Usage
 
@@ -53,16 +53,16 @@ while zig-out/bin/server; do sleep 0.1; done
 watchexec -r -e zig,md,css,js -- zig build run
 ```
 
-### Manual Reloader
+### Manual reload
 
 Trigger browser reloads from application code without restarting:
 
 ```zig
 const livereload = try server.middleware(LiveReload, .{});
-const reload_handle = LiveReload.reloader(livereload);
+const lr = LiveReload.from(livereload);
 
 // Later, from a file watcher or other trigger:
-reload_handle.reload();  // all connected browsers reload
+lr.reload();  // all connected browsers reload
 ```
 
 ## Config
@@ -121,7 +121,7 @@ Same pattern, adapted for Zig and httpz:
 | SSE mechanism | Async streaming body | `res.startEventStream` (thread per SSE) |
 | Script injection | Response body wrapper | Append to `res.body` / writer in middleware |
 | Restart detection | SSE connection drop + reconnect | SSE reconnect + binary self-watch |
-| Manual reload | `Reloader::reload()` via `tokio::Notify` | `reloader.reload()` via Mutex + Condition |
+| Manual reload | `Reloader::reload()` via `tokio::Notify` | `lr.reload()` via Mutex + Condition |
 | Heuristic | `Content-Type: text/html` | `res.content_type == .HTML` |
 
 ## License

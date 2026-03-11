@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const mod = b.addModule("httpz-livereload", .{
-        .root_source_file = b.path("src/livereload.zig"),
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     // ── Tests ────────────────────────────────────────────────────────────────
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/livereload.zig"),
+            .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{

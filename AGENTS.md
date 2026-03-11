@@ -28,10 +28,11 @@ Use [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Repo map
 
-- `src/livereload.zig` — the middleware (SSE endpoint, script injection, binary watcher, Reloader API)
+- `src/root.zig` — the middleware (SSE endpoint, script injection, binary watcher, reload API)
 - `example/main.zig` — minimal httpz server demonstrating the middleware
 - `build.zig` — build script (library module, tests, example)
 - `build.zig.zon` — package manifest and dependency on httpz
+- `docs/` — documentation index
 
 ## Merge strategy
 
@@ -47,6 +48,6 @@ Use [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Orientation
 
-- **Entry point**: `src/livereload.zig` — single-file httpz middleware.
+- **Entry point**: `src/root.zig` — single-file httpz middleware.
 - **Domain**: dev-only browser reload middleware for the httpz web framework.
-- **Stack**: Zig 0.15, httpz.
+- **Stack**: Zig 0.15.2, httpz.
