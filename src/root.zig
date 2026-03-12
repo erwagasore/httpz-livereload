@@ -161,8 +161,8 @@ pub fn from(mw: anytype) *LiveReload {
 // ── Directory watching ───────────────────────────────────────────────────────
 
 pub const WatchDirOpts = struct {
-    /// Poll interval in nanoseconds. Default 100ms.
-    poll_ns: u64 = 100 * std.time.ns_per_ms,
+    /// Poll interval in nanoseconds. Default 50ms.
+    poll_ns: u64 = 50 * std.time.ns_per_ms,
 
     /// Optional callback invoked when a change is detected, *before*
     /// signalling browsers to reload. Return an error to skip the
@@ -210,11 +210,7 @@ fn watchDirLoop(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
         std.Thread.sleep(opts.poll_ns);
         const curr = dirMtime(dir);
         if (curr != prev) {
-            // Debounce: wait one more interval, then re-scan. Catches
-            // multi-file writes that land within a single poll window.
-            std.Thread.sleep(opts.poll_ns);
-            prev = dirMtime(dir);
-
+            prev = curr;
             if (opts.on_change) |cb| {
                 cb(opts.ctx) catch |err| {
                     log.warn("watch callback error for '{s}': {}", .{ dir, err });
@@ -457,6 +453,6 @@ test "dirMtime: returns non-zero for existing directory with files" {
 
 test "WatchDirOpts: defaults" {
     const opts = WatchDirOpts{};
-    try testing.expectEqual(@as(u64, 100 * std.time.ns_per_ms), opts.poll_ns);
+    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), opts.poll_ns);
     try testing.expect(opts.on_change == null);
 }
