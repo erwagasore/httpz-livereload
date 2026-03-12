@@ -92,7 +92,8 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     // Once fetch succeeds (headers received), we know the server is
     // back and reload the page — which establishes a fresh EventSource.
     const inject_snippet = try std.fmt.allocPrint(arena,
-        \\<script>(function(){{var ok=false,t,R={d},U="{s}";
+        \\<script>(function(){{if(window.__lr)return;window.__lr=true;
+        \\var ok=false,t,R={d},U="{s}";
         \\function c(){{var s=new EventSource(U);
         \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
         \\s.addEventListener("reload",function(){{s.close();location.reload()}});
