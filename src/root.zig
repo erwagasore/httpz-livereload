@@ -98,7 +98,7 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
         \\S.addEventListener("init",function(){{D=0;if(ok){{S.close();location.reload()}}ok=true}});
         \\S.addEventListener("reload",function(){{S.close();location.reload()}});
         \\S.addEventListener("error",function(){{S.close();ok?p():setTimeout(c,R)}})}}
-        \\function p(){{D=D?Math.min(D*2,2000):R;
+        \\function p(){{D=D?Math.min(D*2,4000):1000;
         \\fetch("/").then(function(){{location.reload()}}).catch(function(){{setTimeout(p,D)}})}}
         \\window.addEventListener("beforeunload",function(){{if(S)S.close()}});
         \\c()}})()</script>
