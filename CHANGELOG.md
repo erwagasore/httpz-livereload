@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.6] — 2026-03-12
+
+### Fixes
+
+- Set `Cache-Control: no-cache, no-store, must-revalidate` on all HTML
+  responses in dev mode. Prevents `location.reload()` from serving stale
+  HTML and CSS from browser cache after a server restart.
+
 ## [0.4.5] — 2026-03-12
 
 ### Fixes
