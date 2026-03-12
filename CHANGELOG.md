@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.9] — 2026-03-12
+
+### Fixes
+
+- Revert client script to v0.4.0 original: pure EventSource reconnection,
+  no fetch() probe, no window.__lr guard. All changes from v0.4.1–v0.4.8
+  caused regressions with CSS/font loading after reload.
+
 ## [0.4.8] — 2026-03-12
 
 ### Fixes

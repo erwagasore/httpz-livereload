@@ -85,21 +85,16 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
 
     // Pre-format the injected script.
     //
-    // On disconnect, the script uses fetch() to probe the server instead
-    // of re-creating EventSource. fetch() fails instantly on connection
-    // refused (~1ms), while EventSource can stall for 2-3s in some
-    // browsers (notably Firefox) before firing its error event.
-    // Once fetch succeeds (headers received), we know the server is
-    // back and reload the page — which establishes a fresh EventSource.
+    // On disconnect the EventSource error handler reconnects after
+    // retry_ms. On reconnect the server sends a fresh "init" event;
+    // if we already received one (ok==true), we know the server
+    // restarted, so we reload the page.
     const inject_snippet = try std.fmt.allocPrint(arena,
-        \\<script>(function(){{if(window.__lr)return;window.__lr=true;
-        \\var ok=false,R={d},U="{s}",S;
-        \\function c(){{S=new EventSource(U);
-        \\S.addEventListener("init",function(){{if(ok){{S.close();location.reload()}}ok=true}});
-        \\S.addEventListener("reload",function(){{S.close();location.reload()}});
-        \\S.addEventListener("error",function(){{S.close();ok?p():setTimeout(c,R)}})}}
-        \\function p(){{fetch("/").then(function(){{location.reload()}}).catch(function(){{setTimeout(p,R)}})}}
-        \\window.addEventListener("beforeunload",function(){{if(S)S.close()}});
+        \\<script>(function(){{var ok=false,t,R={d};
+        \\function c(){{var s=new EventSource("{s}");
+        \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
+        \\s.addEventListener("reload",function(){{s.close();location.reload()}});
+        \\s.addEventListener("error",function(){{s.close();clearTimeout(t);t=setTimeout(c,R)}})}}
         \\c()}})()</script>
     , .{ config.retry_ms, config.path });
 
