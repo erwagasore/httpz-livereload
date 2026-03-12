@@ -39,7 +39,7 @@ pub const Config = struct {
     watch: bool = true,
 
     /// Binary polling interval (nanoseconds).
-    watch_interval_ns: u64 = 500 * std.time.ns_per_ms,
+    watch_interval_ns: u64 = 50 * std.time.ns_per_ms,
 
     /// Reconnection interval (milliseconds). Controls both the SSE
     /// `retry:` directive and the client-side reconnect delay. Lower
@@ -338,8 +338,10 @@ fn watchBinaryLoop(self: *LiveReload) void {
         const mtime = fileMtime(path);
         if (mtime != self.exe_mtime) {
             self.reload();
-            // Let SSE threads flush the reload event before exit.
-            std.Thread.sleep(300 * std.time.ns_per_ms);
+            // Brief pause so SSE threads can flush the reload event.
+            // Browsers reconnect via fast fetch() probe, so this only
+            // needs to cover the kernel TCP write — 50ms is plenty.
+            std.Thread.sleep(50 * std.time.ns_per_ms);
             std.process.exit(0);
         }
     }
