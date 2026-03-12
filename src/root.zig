@@ -93,12 +93,13 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     // back and reload the page — which establishes a fresh EventSource.
     const inject_snippet = try std.fmt.allocPrint(arena,
         \\<script>(function(){{if(window.__lr)return;window.__lr=true;
-        \\var ok=false,R={d},U="{s}",S;
+        \\var ok=false,R={d},U="{s}",S,D;
         \\function c(){{S=new EventSource(U);
-        \\S.addEventListener("init",function(){{if(ok){{S.close();location.reload()}}ok=true}});
+        \\S.addEventListener("init",function(){{D=0;if(ok){{S.close();location.reload()}}ok=true}});
         \\S.addEventListener("reload",function(){{S.close();location.reload()}});
         \\S.addEventListener("error",function(){{S.close();ok?p():setTimeout(c,R)}})}}
-        \\function p(){{fetch("/").then(function(){{location.reload()}}).catch(function(){{setTimeout(p,R)}})}}
+        \\function p(){{D=D?Math.min(D*2,2000):R;
+        \\fetch("/").then(function(){{location.reload()}}).catch(function(){{setTimeout(p,D)}})}}
         \\window.addEventListener("beforeunload",function(){{if(S)S.close()}});
         \\c()}})()</script>
     , .{ config.retry_ms, config.path });
