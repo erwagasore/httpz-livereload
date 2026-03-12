@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.4] — 2026-03-12
+
+### Other
+
+- Start reconnection probe at 1s (was `retry_ms` / 50ms) and raise the
+  backoff cap to 4s — reduces noise in the browser network tab while the
+  server is down without noticeably affecting reload speed.
+
 ## [0.4.3] — 2026-03-12
 
 ### Fixes
