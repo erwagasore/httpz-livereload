@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0] — 2026-03-12
+
+### Fixes
+
+- Binary watcher no longer sends `reload` event before exiting. The
+  reload event caused the browser to request the page from the dying
+  server — HTML might arrive but CSS/fonts hit connection refused.
+  Now the watcher just exits. The browser's EventSource errors, then
+  reconnects once the new server is up. The `init` event triggers a
+  clean reload when all assets are guaranteed to be served.
+
 ## [0.4.9] — 2026-03-12
 
 ### Fixes

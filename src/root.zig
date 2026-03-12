@@ -334,11 +334,11 @@ fn watchBinaryLoop(self: *LiveReload) void {
         std.Thread.sleep(self.watch_interval_ns);
         const mtime = fileMtime(path);
         if (mtime != self.exe_mtime) {
-            self.reload();
-            // Brief pause so SSE threads can flush the reload event.
-            // Browsers reconnect via fast fetch() probe, so this only
-            // needs to cover the kernel TCP write — 50ms is plenty.
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+            // Don't send reload — just exit. The browser's EventSource
+            // will error, then reconnect once the restart loop brings
+            // the new binary up. On reconnect it receives "init" with
+            // ok=true → location.reload(). This guarantees the reload
+            // only fires when the NEW server is ready to serve CSS/fonts.
             std.process.exit(0);
         }
     }
