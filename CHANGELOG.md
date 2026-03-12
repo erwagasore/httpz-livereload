@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.7] — 2026-03-12
+
+### Fixes
+
+- Revert to fixed-interval probe on the SSE endpoint (`/_livereload`).
+  The exponential backoff and `fetch('/')` probe introduced in v0.4.3–v0.4.6
+  caused cached responses to trigger premature reloads with broken CSS.
+  SSE responses are not cacheable, so probing the SSE endpoint directly
+  is reliable.
+
 ## [0.4.6] — 2026-03-12
 
 ### Fixes
