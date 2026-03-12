@@ -205,15 +205,15 @@ pub fn watchDir(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
 }
 
 fn watchDirLoop(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
-    var prev = dirMtime(self.arena, dir);
+    var prev = dirMtime(dir);
     while (true) {
         std.Thread.sleep(opts.poll_ns);
-        const curr = dirMtime(self.arena, dir);
+        const curr = dirMtime(dir);
         if (curr != prev) {
             // Debounce: wait one more interval, then re-scan. Catches
             // multi-file writes that land within a single poll window.
             std.Thread.sleep(opts.poll_ns);
-            prev = dirMtime(self.arena, dir);
+            prev = dirMtime(dir);
 
             if (opts.on_change) |cb| {
                 cb(opts.ctx) catch |err| {
@@ -227,23 +227,33 @@ fn watchDirLoop(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
     }
 }
 
-/// Return the maximum mtime across all files in a directory tree,
-/// using `std.fs.Dir.walk()` for recursive traversal.
-fn dirMtime(arena: std.mem.Allocator, path: []const u8) i128 {
+/// Return the maximum mtime across all files in a directory tree.
+/// Uses allocation-free manual recursion so it's safe to call from
+/// any thread without a shared allocator.
+fn dirMtime(path: []const u8) i128 {
     var best: i128 = 0;
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return 0;
     defer dir.close();
+    walkDirMtime(dir, &best);
+    return best;
+}
 
-    var walker = dir.walk(arena) catch return 0;
-    defer walker.deinit();
-
-    while (walker.next() catch null) |entry| {
-        if (entry.kind == .file) {
-            const stat = entry.dir.statFile(entry.basename) catch continue;
-            if (stat.mtime > best) best = stat.mtime;
+fn walkDirMtime(dir: std.fs.Dir, best: *i128) void {
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        switch (entry.kind) {
+            .file => {
+                const stat = dir.statFile(entry.name) catch continue;
+                if (stat.mtime > best.*) best.* = stat.mtime;
+            },
+            .directory => {
+                var sub = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close();
+                walkDirMtime(sub, best);
+            },
+            else => {},
         }
     }
-    return best;
 }
 
 // ── Middleware execute ────────────────────────────────────────────────────────
@@ -436,12 +446,12 @@ test "execute: HTML responses get script injected" {
 }
 
 test "dirMtime: returns 0 for non-existent path" {
-    try testing.expectEqual(@as(i128, 0), dirMtime(testing.allocator, "__nonexistent_dir__"));
+    try testing.expectEqual(@as(i128, 0), dirMtime("__nonexistent_dir__"));
 }
 
 test "dirMtime: returns non-zero for existing directory with files" {
     // Use src/ which always has root.zig
-    const mtime = dirMtime(testing.allocator, "src");
+    const mtime = dirMtime("src");
     try testing.expect(mtime > 0);
 }
 
