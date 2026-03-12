@@ -39,7 +39,7 @@ pub const Config = struct {
     watch: bool = true,
 
     /// Binary polling interval (nanoseconds).
-    watch_interval_ns: u64 = 500 * std.time.ns_per_ms,
+    watch_interval_ns: u64 = 50 * std.time.ns_per_ms,
 
     /// Reconnection interval (milliseconds). Controls both the SSE
     /// `retry:` directive and the client-side reconnect delay. Lower
@@ -85,15 +85,20 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
 
     // Pre-format the injected script.
     //
-    // On disconnect the script bypasses EventSource's built-in retry
-    // (which waits the full `retry` interval) and instead re-creates
-    // the EventSource after a short delay for snappier reconnects.
+    // On disconnect, the script uses fetch() to probe the server instead
+    // of re-creating EventSource. fetch() fails instantly on connection
+    // refused (~1ms), while EventSource can stall for 2-3s in some
+    // browsers (notably Firefox) before firing its error event.
+    // Once fetch succeeds (headers received), we know the server is
+    // back and reload the page — which establishes a fresh EventSource.
     const inject_snippet = try std.fmt.allocPrint(arena,
-        \\<script>(function(){{var ok=false,t,R={d};
-        \\function c(){{var s=new EventSource("{s}");
+        \\<script>(function(){{if(window.__lr)return;window.__lr=true;
+        \\var ok=false,R={d},U="{s}";
+        \\function c(){{var s=new EventSource(U);
         \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
         \\s.addEventListener("reload",function(){{s.close();location.reload()}});
-        \\s.addEventListener("error",function(){{s.close();clearTimeout(t);t=setTimeout(c,R)}})}}
+        \\s.addEventListener("error",function(){{s.close();ok?p():setTimeout(c,R)}})}}
+        \\function p(){{fetch(U).then(function(){{location.reload()}}).catch(function(){{setTimeout(p,R)}})}}
         \\c()}})()</script>
     , .{ config.retry_ms, config.path });
 
@@ -160,18 +165,19 @@ pub fn from(mw: anytype) *LiveReload {
 
 // ── Directory watching ───────────────────────────────────────────────────────
 
+pub const OnChangeFn = struct {
+    cb: *const fn (*anyopaque) anyerror!void,
+    ctx: *anyopaque,
+};
+
 pub const WatchDirOpts = struct {
-    /// Poll interval in nanoseconds. Default 100ms.
-    poll_ns: u64 = 100 * std.time.ns_per_ms,
+    /// Poll interval in nanoseconds. Default 50ms.
+    poll_ns: u64 = 50 * std.time.ns_per_ms,
 
     /// Optional callback invoked when a change is detected, *before*
     /// signalling browsers to reload. Return an error to skip the
     /// reload for this change (e.g. if re-parsing content failed).
-    on_change: ?*const fn (*anyopaque) anyerror!void = null,
-
-    /// Opaque context pointer passed to `on_change`. Ignored when
-    /// `on_change` is null; must be set when `on_change` is provided.
-    ctx: *anyopaque = undefined,
+    on_change: ?OnChangeFn = null,
 };
 
 /// Watch a directory tree for file changes. When a modification is
@@ -188,8 +194,7 @@ pub const WatchDirOpts = struct {
 /// const lr = LiveReload.from(mw);
 /// lr.watchDir("content", .{
 ///     .poll_ns = 50 * std.time.ns_per_ms,
-///     .on_change = &MyApp.reloadContent,
-///     .ctx = @ptrCast(app),
+///     .on_change = .{ .cb = &MyApp.reloadContent, .ctx = @ptrCast(app) },
 /// });
 /// lr.watchDir("static", .{});
 /// ```
@@ -210,13 +215,9 @@ fn watchDirLoop(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
         std.Thread.sleep(opts.poll_ns);
         const curr = dirMtime(dir);
         if (curr != prev) {
-            // Debounce: wait one more interval, then re-scan. Catches
-            // multi-file writes that land within a single poll window.
-            std.Thread.sleep(opts.poll_ns);
-            prev = dirMtime(dir);
-
-            if (opts.on_change) |cb| {
-                cb(opts.ctx) catch |err| {
+            prev = curr;
+            if (opts.on_change) |handler| {
+                handler.cb(handler.ctx) catch |err| {
                     log.warn("watch callback error for '{s}': {}", .{ dir, err });
                     continue;
                 };
@@ -338,8 +339,10 @@ fn watchBinaryLoop(self: *LiveReload) void {
         const mtime = fileMtime(path);
         if (mtime != self.exe_mtime) {
             self.reload();
-            // Let SSE threads flush the reload event before exit.
-            std.Thread.sleep(300 * std.time.ns_per_ms);
+            // Brief pause so SSE threads can flush the reload event.
+            // Browsers reconnect via fast fetch() probe, so this only
+            // needs to cover the kernel TCP write — 50ms is plenty.
+            std.Thread.sleep(50 * std.time.ns_per_ms);
             std.process.exit(0);
         }
     }
@@ -457,6 +460,6 @@ test "dirMtime: returns non-zero for existing directory with files" {
 
 test "WatchDirOpts: defaults" {
     const opts = WatchDirOpts{};
-    try testing.expectEqual(@as(u64, 100 * std.time.ns_per_ms), opts.poll_ns);
+    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), opts.poll_ns);
     try testing.expect(opts.on_change == null);
 }
