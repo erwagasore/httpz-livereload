@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.2] — 2026-03-12
+
+### Fixes
+
+- Close EventSource on `beforeunload` to prevent browser console errors
+  when navigating away from a page with an active SSE connection.
+- Probe the root URL (`/`) instead of the SSE endpoint for reconnection —
+  avoids spawning an orphaned `sseWriter` thread on each fetch probe.
+
 ## [0.4.1] — 2026-03-12
 
 ### Fixes
