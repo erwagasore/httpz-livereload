@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.5] — 2026-03-12
+
+### Fixes
+
+- Bypass browser cache on reconnection probe (`cache: 'no-store'`).
+  Without this, `fetch('/')` could resolve from cache while the server
+  was still down, causing a premature reload with broken CSS/JS.
+
 ## [0.4.4] — 2026-03-12
 
 ### Other
