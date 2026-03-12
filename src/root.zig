@@ -283,6 +283,9 @@ pub fn execute(self: *LiveReload, req: *httpz.Request, res: *httpz.Response, exe
 
     if (res.content_type == .HTML) {
         self.injectScript(res);
+        // Prevent browser from caching HTML in dev — ensures reload
+        // always fetches fresh content from the (possibly new) server.
+        res.header("cache-control", "no-cache, no-store, must-revalidate");
     }
 }
 
