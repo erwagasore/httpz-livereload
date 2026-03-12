@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.1] — 2026-03-12
+
+### Fixes
+
+- Prevent duplicate SSE connections on SPA-style navigation by guarding
+  against re-injection with `window.__lr`.
+- Use allocation-free manual recursion in `dirMtime` instead of
+  `std.fs.Dir.walk()` for thread safety — avoids sharing a non-thread-safe
+  arena allocator across concurrent watcher threads.
+
+### Other
+
+- Use `fetch()` probe for reconnection instead of re-creating EventSource —
+  fails instantly on connection refused (~1ms vs 2-3s stall in Firefox).
+- Lower default poll intervals: binary watcher 500ms → 50ms, directory
+  watcher 100ms → 50ms, post-reload exit delay 300ms → 50ms.
+- Drop explicit debounce in directory watcher — at 50ms poll, rapid writes
+  coalesce naturally.
+- Bundle `on_change` callback and context into a single `OnChangeFn` struct;
+  remove dead `t` variable from injected JavaScript.
+
 ## [0.4.0] — 2026-03-12
 
 ### Features
