@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.3] — 2026-03-12
+
+### Fixes
+
+- Use exponential backoff for the `fetch()` reconnection probe — starts
+  at `retry_ms` and doubles up to a 2s cap, reducing unnecessary network
+  churn when the server is down for longer periods.
+
 ## [0.4.2] — 2026-03-12
 
 ### Fixes
