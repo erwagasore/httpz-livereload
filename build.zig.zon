@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xdd15a15d3c5bbb88,
     .name = .httpz_livereload,
-    .version = "0.5.0",
+    .version = "0.5.1",
     .dependencies = .{
         .httpz = .{
             .url = "git+https://github.com/karlseguin/http.zig#9ef2ffe8d611ff2e1081e5cf39cb4632c145c5b9",

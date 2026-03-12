@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1] — 2026-03-12
+
+### Fixes
+
+- Re-add `window.__lr` guard to prevent duplicate EventSource connections
+  on SPA-style navigations. This was lost in the v0.4.9 revert.
+
 ## [0.5.0] — 2026-03-12
 
 ### Fixes

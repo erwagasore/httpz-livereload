@@ -90,7 +90,8 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     // if we already received one (ok==true), we know the server
     // restarted, so we reload the page.
     const inject_snippet = try std.fmt.allocPrint(arena,
-        \\<script>(function(){{var ok=false,t,R={d};
+        \\<script>(function(){{if(window.__lr)return;window.__lr=true;
+        \\var ok=false,t,R={d};
         \\function c(){{var s=new EventSource("{s}");
         \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
         \\s.addEventListener("reload",function(){{s.close();location.reload()}});
