@@ -98,7 +98,7 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
         \\S.addEventListener("init",function(){{if(ok){{S.close();location.reload()}}ok=true}});
         \\S.addEventListener("reload",function(){{S.close();location.reload()}});
         \\S.addEventListener("error",function(){{S.close();ok?p():setTimeout(c,R)}})}}
-        \\function p(){{fetch(U,{{cache:"no-store"}}).then(function(){{location.reload()}}).catch(function(){{setTimeout(p,R)}})}}
+        \\function p(){{fetch("/").then(function(){{location.reload()}}).catch(function(){{setTimeout(p,R)}})}}
         \\window.addEventListener("beforeunload",function(){{if(S)S.close()}});
         \\c()}})()</script>
     , .{ config.retry_ms, config.path });
@@ -282,9 +282,6 @@ pub fn execute(self: *LiveReload, req: *httpz.Request, res: *httpz.Response, exe
 
     if (res.content_type == .HTML) {
         self.injectScript(res);
-        // Prevent browser from caching HTML in dev — ensures reload
-        // always fetches fresh content from the (possibly new) server.
-        res.header("cache-control", "no-cache, no-store, must-revalidate");
     }
 }
 

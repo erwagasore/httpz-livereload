@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.8] — 2026-03-12
+
+### Fixes
+
+- Revert reconnection script and middleware to v0.4.2 behavior. The
+  `cache:"no-store"` fetch option and `Cache-Control` header added in
+  v0.4.5–v0.4.7 caused CSS and fonts to not load after reload.
+
 ## [0.4.7] — 2026-03-12
 
 ### Fixes
