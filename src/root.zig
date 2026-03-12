@@ -99,7 +99,7 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
         \\S.addEventListener("reload",function(){{S.close();location.reload()}});
         \\S.addEventListener("error",function(){{S.close();ok?p():setTimeout(c,R)}})}}
         \\function p(){{D=D?Math.min(D*2,4000):1000;
-        \\fetch("/").then(function(){{location.reload()}}).catch(function(){{setTimeout(p,D)}})}}
+        \\fetch("/",{{cache:"no-store"}}).then(function(){{location.reload()}}).catch(function(){{setTimeout(p,D)}})}}
         \\window.addEventListener("beforeunload",function(){{if(S)S.close()}});
         \\c()}})()</script>
     , .{ config.retry_ms, config.path });
