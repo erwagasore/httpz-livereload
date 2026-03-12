@@ -85,15 +85,19 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
 
     // Pre-format the injected script.
     //
-    // On disconnect the script bypasses EventSource's built-in retry
-    // (which waits the full `retry` interval) and instead re-creates
-    // the EventSource after a short delay for snappier reconnects.
+    // On disconnect, the script uses fetch() to probe the server instead
+    // of re-creating EventSource. fetch() fails instantly on connection
+    // refused (~1ms), while EventSource can stall for 2-3s in some
+    // browsers (notably Firefox) before firing its error event.
+    // Once fetch succeeds (headers received), we know the server is
+    // back and reload the page — which establishes a fresh EventSource.
     const inject_snippet = try std.fmt.allocPrint(arena,
-        \\<script>(function(){{var ok=false,t,R={d};
-        \\function c(){{var s=new EventSource("{s}");
+        \\<script>(function(){{var ok=false,t,R={d},U="{s}";
+        \\function c(){{var s=new EventSource(U);
         \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
         \\s.addEventListener("reload",function(){{s.close();location.reload()}});
-        \\s.addEventListener("error",function(){{s.close();clearTimeout(t);t=setTimeout(c,R)}})}}
+        \\s.addEventListener("error",function(){{s.close();ok?p():setTimeout(c,R)}})}}
+        \\function p(){{fetch(U).then(function(){{location.reload()}}).catch(function(){{t=setTimeout(p,R)}})}}
         \\c()}})()</script>
     , .{ config.retry_ms, config.path });
 
