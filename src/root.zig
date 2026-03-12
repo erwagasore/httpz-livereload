@@ -93,12 +93,12 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     // back and reload the page — which establishes a fresh EventSource.
     const inject_snippet = try std.fmt.allocPrint(arena,
         \\<script>(function(){{if(window.__lr)return;window.__lr=true;
-        \\var ok=false,t,R={d},U="{s}";
+        \\var ok=false,R={d},U="{s}";
         \\function c(){{var s=new EventSource(U);
         \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
         \\s.addEventListener("reload",function(){{s.close();location.reload()}});
         \\s.addEventListener("error",function(){{s.close();ok?p():setTimeout(c,R)}})}}
-        \\function p(){{fetch(U).then(function(){{location.reload()}}).catch(function(){{t=setTimeout(p,R)}})}}
+        \\function p(){{fetch(U).then(function(){{location.reload()}}).catch(function(){{setTimeout(p,R)}})}}
         \\c()}})()</script>
     , .{ config.retry_ms, config.path });
 
@@ -165,6 +165,11 @@ pub fn from(mw: anytype) *LiveReload {
 
 // ── Directory watching ───────────────────────────────────────────────────────
 
+pub const OnChangeFn = struct {
+    cb: *const fn (*anyopaque) anyerror!void,
+    ctx: *anyopaque,
+};
+
 pub const WatchDirOpts = struct {
     /// Poll interval in nanoseconds. Default 50ms.
     poll_ns: u64 = 50 * std.time.ns_per_ms,
@@ -172,11 +177,7 @@ pub const WatchDirOpts = struct {
     /// Optional callback invoked when a change is detected, *before*
     /// signalling browsers to reload. Return an error to skip the
     /// reload for this change (e.g. if re-parsing content failed).
-    on_change: ?*const fn (*anyopaque) anyerror!void = null,
-
-    /// Opaque context pointer passed to `on_change`. Ignored when
-    /// `on_change` is null; must be set when `on_change` is provided.
-    ctx: *anyopaque = undefined,
+    on_change: ?OnChangeFn = null,
 };
 
 /// Watch a directory tree for file changes. When a modification is
@@ -193,8 +194,7 @@ pub const WatchDirOpts = struct {
 /// const lr = LiveReload.from(mw);
 /// lr.watchDir("content", .{
 ///     .poll_ns = 50 * std.time.ns_per_ms,
-///     .on_change = &MyApp.reloadContent,
-///     .ctx = @ptrCast(app),
+///     .on_change = .{ .cb = &MyApp.reloadContent, .ctx = @ptrCast(app) },
 /// });
 /// lr.watchDir("static", .{});
 /// ```
@@ -216,8 +216,8 @@ fn watchDirLoop(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
         const curr = dirMtime(dir);
         if (curr != prev) {
             prev = curr;
-            if (opts.on_change) |cb| {
-                cb(opts.ctx) catch |err| {
+            if (opts.on_change) |handler| {
+                handler.cb(handler.ctx) catch |err| {
                     log.warn("watch callback error for '{s}': {}", .{ dir, err });
                     continue;
                 };
