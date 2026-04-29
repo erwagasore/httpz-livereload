@@ -19,8 +19,8 @@
 //!
 //! A background thread can optionally watch the server binary on disk.
 //! When its mtime changes (e.g. `zig build --watch` rebuilt it), the
-//! middleware signals browsers and exits the process so a wrapper can
-//! restart it with new code.
+//! middleware exits the process so a wrapper can restart it with new code.
+//! Browsers reload after their EventSource reconnects to the new server.
 
 const std = @import("std");
 const httpz = @import("httpz");
@@ -34,8 +34,8 @@ pub const Config = struct {
     /// SSE endpoint path.
     path: []const u8 = "/_livereload",
 
-    /// Watch the server binary for changes. On change, signal browsers
-    /// and exit(0) so a restart wrapper can relaunch with new code.
+    /// Watch the server binary for changes. On change, exit(0) so a
+    /// restart wrapper can relaunch with new code.
     watch: bool = true,
 
     /// Binary polling interval (nanoseconds).
@@ -47,12 +47,16 @@ pub const Config = struct {
     /// extra TCP attempts while the server is down (negligible on
     /// localhost).
     retry_ms: u16 = 50,
+
+    /// I/O implementation used for blocking filesystem operations,
+    /// sleeps, and synchronization waits. Zig 0.16 applications should
+    /// usually pass `init.io` from `main(init: std.process.Init)`.
+    io: std.Io = std.Options.debug_io,
 };
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-// Immutable after init. All slices live on the server arena;
-// path points into the Config literal or the server arena.
+// Immutable after init. All slices live on the server arena.
 path: []const u8,
 inject_snippet: []const u8,
 sse_init_msg: []const u8,
@@ -68,20 +72,35 @@ watch_interval_ns: u64,
 // stable pointer until execute() is called on the arena-allocated copy.
 watcher_spawned: std.atomic.Value(bool),
 
-// Server arena — never freed, lives as long as the process. Used to
-// allocate paths passed to detached watcher threads so their memory
-// is guaranteed to outlive the thread.
+// Long-lived allocations owned by httpz's server arena. httpz calls
+// deinit() before freeing this arena, so watcher threads must be joined
+// before deinit() returns.
 arena: std.mem.Allocator,
 
+// General allocator used for middleware-owned bookkeeping that deinit()
+// explicitly frees.
+allocator: std.mem.Allocator,
+
+// I/O implementation used by watcher threads and synchronization waits.
+io: std.Io,
+
+// Background watcher threads owned by this middleware.
+threads_mu: std.Io.Mutex,
+threads: std.ArrayList(std.Thread),
+stopping: std.atomic.Value(bool),
+
 // Mutable shared state guarded by mu.
-mu: std.Thread.Mutex,
-cond: std.Thread.Condition,
+mu: std.Io.Mutex,
+cond: std.Io.Condition,
 generation: u64,
+active_sse: u64,
 
 // ── Init / deinit ────────────────────────────────────────────────────────────
 
 pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     const arena = mc.arena;
+
+    const path = try arena.dupe(u8, config.path);
 
     // Pre-format the injected script.
     //
@@ -97,10 +116,11 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
         \\s.addEventListener("reload",function(){{s.close();location.reload()}});
         \\s.addEventListener("error",function(){{s.close();clearTimeout(t);t=setTimeout(c,R)}})}}
         \\c()}})()</script>
-    , .{ config.retry_ms, config.path });
+    , .{ config.retry_ms, path });
 
     // Pre-format the SSE init message with the configured retry interval.
-    const sse_init_msg = try std.fmt.allocPrint(arena,
+    const sse_init_msg = try std.fmt.allocPrint(
+        arena,
         "retry:{d}\nevent:init\ndata:\n\n",
         .{config.retry_ms},
     );
@@ -110,14 +130,14 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
     var exe_mtime: i128 = 0;
     if (config.watch) {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.fs.selfExePath(&buf)) |p| {
-            exe_path = try arena.dupeZ(u8, p);
-            exe_mtime = fileMtime(exe_path.?);
+        if (std.process.executablePath(config.io, &buf)) |n| {
+            exe_path = try arena.dupeZ(u8, buf[0..n]);
+            exe_mtime = fileMtime(config.io, exe_path.?);
         } else |_| {}
     }
 
     return .{
-        .path = config.path,
+        .path = path,
         .inject_snippet = inject_snippet,
         .sse_init_msg = sse_init_msg,
         .exe_path = exe_path,
@@ -125,14 +145,37 @@ pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
         .watch_interval_ns = config.watch_interval_ns,
         .watcher_spawned = std.atomic.Value(bool).init(false),
         .arena = arena,
-        .mu = .{},
-        .cond = .{},
+        .allocator = mc.allocator,
+        .io = config.io,
+        .threads_mu = .init,
+        .threads = .empty,
+        .stopping = std.atomic.Value(bool).init(false),
+        .mu = .init,
+        .cond = .init,
         .generation = 0,
+        .active_sse = 0,
     };
 }
 
-/// Nothing to clean up — all memory is on the server arena.
-pub fn deinit(_: *const LiveReload) void {}
+pub fn deinit(self: *LiveReload) void {
+    self.stopping.store(true, .release);
+
+    // Wake SSE writers parked on the condition variable and wait for them
+    // to leave before httpz frees the middleware arena.
+    self.mu.lockUncancelable(self.io);
+    self.cond.broadcast(self.io);
+    while (self.active_sse > 0) {
+        self.cond.waitUncancelable(self.io, &self.mu);
+    }
+    self.mu.unlock(self.io);
+
+    self.threads_mu.lockUncancelable(self.io);
+    defer self.threads_mu.unlock(self.io);
+    for (self.threads.items) |thread| {
+        thread.join();
+    }
+    self.threads.deinit(self.allocator);
+}
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -142,10 +185,10 @@ pub fn deinit(_: *const LiveReload) void {}
 /// file changed on disk and the running server already serves the new
 /// version.
 pub fn reload(self: *LiveReload) void {
-    self.mu.lock();
-    defer self.mu.unlock();
+    self.mu.lockUncancelable(self.io);
+    defer self.mu.unlock(self.io);
     self.generation +%= 1;
-    self.cond.broadcast();
+    self.cond.broadcast(self.io);
 }
 
 /// Extract the concrete `*LiveReload` from a type-erased `httpz.Middleware`
@@ -196,21 +239,25 @@ pub const WatchDirOpts = struct {
 /// lr.watchDir("static", .{});
 /// ```
 pub fn watchDir(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
+    if (self.stopping.load(.acquire)) return;
+
     const owned = self.arena.dupe(u8, dir) catch |err| {
         log.warn("could not allocate watch path for '{s}': {}", .{ dir, err });
         return;
     };
-    // Thread is intentionally detached — it runs until process exit.
-    _ = std.Thread.spawn(.{}, watchDirLoop, .{ self, owned, opts }) catch |err| {
-        log.warn("could not start directory watcher for '{s}': {}", .{ dir, err });
+    self.spawnBackground(watchDirLoop, .{ self, owned, opts }) catch |err| {
+        if (err != error.Stopping) {
+            log.warn("could not start directory watcher for '{s}': {}", .{ dir, err });
+        }
     };
 }
 
 fn watchDirLoop(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
-    var prev = dirMtime(dir);
-    while (true) {
-        std.Thread.sleep(opts.poll_ns);
-        const curr = dirMtime(dir);
+    var prev = dirMtime(self.io, dir);
+    while (!self.stopping.load(.acquire)) {
+        sleepNs(self, opts.poll_ns);
+        if (self.stopping.load(.acquire)) break;
+        const curr = dirMtime(self.io, dir);
         if (curr != prev) {
             prev = curr;
             if (opts.on_change) |handler| {
@@ -228,26 +275,31 @@ fn watchDirLoop(self: *LiveReload, dir: []const u8, opts: WatchDirOpts) void {
 /// Return the maximum mtime across all files in a directory tree.
 /// Uses allocation-free manual recursion so it's safe to call from
 /// any thread without a shared allocator.
-fn dirMtime(path: []const u8) i128 {
+fn dirMtime(io: std.Io, path: []const u8) i128 {
     var best: i128 = 0;
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return 0;
-    defer dir.close();
-    walkDirMtime(dir, &best);
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    walkDirMtime(io, dir, &best);
     return best;
 }
 
-fn walkDirMtime(dir: std.fs.Dir, best: *i128) void {
+fn walkDirMtime(io: std.Io, dir: std.Io.Dir, best: *i128) void {
+    const dir_stat = dir.stat(io) catch null;
+    if (dir_stat) |stat| {
+        if (stat.mtime.nanoseconds > best.*) best.* = stat.mtime.nanoseconds;
+    }
+
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(io) catch null) |entry| {
         switch (entry.kind) {
             .file => {
-                const stat = dir.statFile(entry.name) catch continue;
-                if (stat.mtime > best.*) best.* = stat.mtime;
+                const stat = dir.statFile(io, entry.name, .{}) catch continue;
+                if (stat.mtime.nanoseconds > best.*) best.* = stat.mtime.nanoseconds;
             },
             .directory => {
-                var sub = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
-                defer sub.close();
-                walkDirMtime(sub, best);
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                walkDirMtime(io, sub, best);
             },
             else => {},
         }
@@ -265,7 +317,12 @@ pub fn execute(self: *LiveReload, req: *httpz.Request, res: *httpz.Response, exe
     if (self.exe_path != null and
         self.watcher_spawned.cmpxchgStrong(false, true, .release, .monotonic) == null)
     {
-        _ = std.Thread.spawn(.{}, watchBinaryLoop, .{self}) catch {};
+        self.spawnBackground(watchBinaryLoop, .{self}) catch |err| {
+            self.watcher_spawned.store(false, .release);
+            if (err != error.Stopping) {
+                log.warn("could not start binary watcher: {}", .{err});
+            }
+        };
     }
 
     // SSE endpoint — respond and short-circuit.
@@ -285,25 +342,52 @@ pub fn execute(self: *LiveReload, req: *httpz.Request, res: *httpz.Response, exe
 
 const sse_reload = "event:reload\ndata:\n\n";
 
+const SseContext = struct {
+    lr: *LiveReload,
+    io: std.Io,
+};
+
 fn serveSSE(self: *LiveReload, res: *httpz.Response) !void {
-    try res.startEventStream(self, sseWriter);
+    try res.startEventStream(SseContext{ .lr = self, .io = res.conn.io }, sseWriter);
 }
 
-/// Runs in a detached thread — no allocator available.
-fn sseWriter(self: *LiveReload, stream: std.net.Stream) void {
-    stream.writeAll(self.sse_init_msg) catch return;
+/// Runs in an httpz-managed detached thread.
+fn sseWriter(ctx: SseContext, stream: std.Io.net.Stream) void {
+    const self = ctx.lr;
+
+    self.mu.lockUncancelable(self.io);
+    if (self.stopping.load(.acquire)) {
+        self.mu.unlock(self.io);
+        return;
+    }
+    self.active_sse += 1;
+    self.mu.unlock(self.io);
+    defer {
+        self.mu.lockUncancelable(self.io);
+        self.active_sse -= 1;
+        self.cond.broadcast(self.io);
+        self.mu.unlock(self.io);
+    }
+
+    var writer = stream.writer(ctx.io, &.{});
+    const w = &writer.interface;
+
+    w.writeAll(self.sse_init_msg) catch return;
+    w.flush() catch return;
 
     // Park until a reload is signalled.
     {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         const gen = self.generation;
-        while (self.generation == gen) {
-            self.cond.wait(&self.mu);
+        while (self.generation == gen and !self.stopping.load(.acquire)) {
+            self.cond.waitUncancelable(self.io, &self.mu);
         }
+        if (self.stopping.load(.acquire)) return;
     }
 
-    stream.writeAll(sse_reload) catch {};
+    w.writeAll(sse_reload) catch return;
+    w.flush() catch {};
 }
 
 // ── Script injection ─────────────────────────────────────────────────────────
@@ -331,9 +415,10 @@ fn injectScript(self: *const LiveReload, res: *httpz.Response) void {
 
 fn watchBinaryLoop(self: *LiveReload) void {
     const path = self.exe_path orelse return;
-    while (true) {
-        std.Thread.sleep(self.watch_interval_ns);
-        const mtime = fileMtime(path);
+    while (!self.stopping.load(.acquire)) {
+        sleepNs(self, self.watch_interval_ns);
+        if (self.stopping.load(.acquire)) break;
+        const mtime = fileMtime(self.io, path);
         if (mtime != self.exe_mtime) {
             // Don't send reload — just exit. The browser's EventSource
             // will error, then reconnect once the restart loop brings
@@ -345,9 +430,29 @@ fn watchBinaryLoop(self: *LiveReload) void {
     }
 }
 
-fn fileMtime(path: [:0]const u8) i128 {
-    const stat = std.fs.cwd().statFile(path) catch return 0;
-    return stat.mtime;
+fn spawnBackground(self: *LiveReload, comptime func: anytype, args: anytype) !void {
+    self.threads_mu.lockUncancelable(self.io);
+    defer self.threads_mu.unlock(self.io);
+
+    if (self.stopping.load(.acquire)) return error.Stopping;
+    try self.threads.ensureUnusedCapacity(self.allocator, 1);
+
+    const thread = try std.Thread.spawn(.{}, func, args);
+    self.threads.appendAssumeCapacity(thread);
+}
+
+fn fileMtime(io: std.Io, path: [:0]const u8) i128 {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
+    return stat.mtime.nanoseconds;
+}
+
+fn sleepNs(self: *LiveReload, ns: u64) void {
+    var remaining = ns;
+    while (remaining > 0 and !self.stopping.load(.acquire)) {
+        const chunk = @min(remaining, 50 * std.time.ns_per_ms);
+        std.Io.sleep(self.io, .fromNanoseconds(@intCast(chunk)), .awake) catch {};
+        remaining -= chunk;
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -371,9 +476,15 @@ fn testInstance() LiveReload {
         .watch_interval_ns = 0,
         .watcher_spawned = std.atomic.Value(bool).init(false),
         .arena = testing.allocator,
-        .mu = .{},
-        .cond = .{},
+        .allocator = testing.allocator,
+        .io = std.Options.debug_io,
+        .threads_mu = .init,
+        .threads = .empty,
+        .stopping = std.atomic.Value(bool).init(false),
+        .mu = .init,
+        .cond = .init,
         .generation = 0,
+        .active_sse = 0,
     };
 }
 
@@ -384,6 +495,23 @@ test "reload increments generation" {
     try testing.expectEqual(@as(u64, 1), lr.generation);
     lr.reload();
     try testing.expectEqual(@as(u64, 2), lr.generation);
+}
+
+test "init: copies configured path onto server arena" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var path_buf = [_]u8{ '/', '_', 'x' };
+    const lr = try LiveReload.init(.{
+        .path = path_buf[0..],
+        .watch = false,
+    }, .{
+        .arena = arena.allocator(),
+        .allocator = testing.allocator,
+    });
+
+    path_buf[2] = 'y';
+    try testing.expectEqualStrings("/_x", lr.path);
 }
 
 test "injectScript: appends to body" {
@@ -446,12 +574,12 @@ test "execute: HTML responses get script injected" {
 }
 
 test "dirMtime: returns 0 for non-existent path" {
-    try testing.expectEqual(@as(i128, 0), dirMtime("__nonexistent_dir__"));
+    try testing.expectEqual(@as(i128, 0), dirMtime(std.Options.debug_io, "__nonexistent_dir__"));
 }
 
 test "dirMtime: returns non-zero for existing directory with files" {
     // Use src/ which always has root.zig
-    const mtime = dirMtime("src");
+    const mtime = dirMtime(std.Options.debug_io, "src");
     try testing.expect(mtime > 0);
 }
 

@@ -2,10 +2,11 @@
     .fingerprint = 0xdd15a15d3c5bbb88,
     .name = .httpz_livereload,
     .version = "0.5.1",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .httpz = .{
-            .url = "git+https://github.com/karlseguin/http.zig#9ef2ffe8d611ff2e1081e5cf39cb4632c145c5b9",
-            .hash = "httpz-0.0.0-PNVzrIowBwAFr_kqBN1W4KBMC2Ofutasj2ZfNAIcfTzF",
+            .url = "git+https://github.com/karlseguin/http.zig#9529d10cb7ef2d9a56e2e8e859afddabf6badf5c",
+            .hash = "httpz-0.0.0-PNVzrBu9BwC__muOxHYDIFGgKbhmsNWQHitrR0BIweJY",
         },
     },
     .paths = .{

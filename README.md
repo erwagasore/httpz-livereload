@@ -4,19 +4,22 @@ Browser reload middleware for [httpz](https://github.com/karlseguin/http.zig).
 
 Inspired by [tower-livereload](https://github.com/leotaku/tower-livereload).
 
+## Compatibility
+
+Requires Zig 0.16.0 or newer and the current httpz API.
+
 ## How it works
 
 1. HTML responses get a `<script>` appended that opens an
    [EventSource](https://developer.mozilla.org/en-US/docs/Web/API/EventSource)
    to `/_livereload`.
-2. The SSE endpoint sends `event: init` with a unique server ID, then holds
-   the connection open.
+2. The SSE endpoint sends `event: init`, then holds the connection open.
 3. The middleware detects restarts two ways:
    - **Process restart**: SSE connections drop. The browser reconnects, sees a
-     new server ID, and reloads.
+     new `init` event, and reloads.
    - **Binary change**: a background thread watches the server executable on
-     disk. When it changes, all browsers are signalled to reload and the
-     process exits so it can restart with new code.
+     disk. When it changes, the process exits so it can restart with new code;
+     browsers reload after reconnecting to the new server.
 4. For explicit reloads without restart (e.g. content file changes), call
    `reload()` from application code.
 
@@ -25,8 +28,9 @@ Inspired by [tower-livereload](https://github.com/leotaku/tower-livereload).
 ```zig
 const LiveReload = @import("httpz-livereload");
 
-// Create the middleware
-const livereload = try server.middleware(LiveReload, .{});
+// Create the middleware. In Zig 0.16, pass `init.io` from
+// `pub fn main(init: std.process.Init) !void`.
+const livereload = try server.middleware(LiveReload, .{ .io = init.io });
 
 // Add to your middleware chain
 var r = try server.router(.{ .middlewares = &.{ livereload } });
@@ -59,7 +63,7 @@ Watch content or static directories for changes — the middleware detects
 file modifications and reloads all connected browsers automatically:
 
 ```zig
-const livereload = try server.middleware(LiveReload, .{ .watch = false });
+const livereload = try server.middleware(LiveReload, .{ .io = init.io, .watch = false });
 const lr = LiveReload.from(livereload);
 
 // Static files: just reload browsers on change
@@ -68,25 +72,27 @@ lr.watchDir("static", .{});
 // Content files: run a callback before reloading (e.g. re-parse markdown)
 lr.watchDir("content", .{
     .poll_ns = 50 * std.time.ns_per_ms,  // check every 50ms
-    .on_change = &struct {
-        fn f(ctx: ?*anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx.?));
-            try app.reloadContent();
-        }
-    }.f,
-    .ctx = @ptrCast(app),
+    .on_change = .{
+        .cb = &struct {
+            fn f(ctx: *anyopaque) !void {
+                const app: *App = @ptrCast(@alignCast(ctx));
+                try app.reloadContent();
+            }
+        }.f,
+        .ctx = @ptrCast(app),
+    },
 });
 ```
 
 Each call spawns a lightweight background thread. Default poll interval
-is 100ms.
+is 50ms.
 
 ### Manual reload
 
 Trigger browser reloads from application code without restarting:
 
 ```zig
-const livereload = try server.middleware(LiveReload, .{});
+const livereload = try server.middleware(LiveReload, .{ .io = init.io });
 const lr = LiveReload.from(livereload);
 
 // Later, from a file watcher or other trigger:
@@ -101,6 +107,7 @@ const livereload = try server.middleware(LiveReload, .{
     .watch = true,                     // watch own binary for changes
     .watch_interval_ns = 500_000_000,  // check every 500ms
     .retry_ms = 50,                    // browser reconnect interval (ms)
+    .io = init.io,                     // Zig 0.16 I/O implementation
 });
 ```
 
@@ -125,7 +132,7 @@ Add to `build.zig.zon`:
 
 ```zig
 .@"httpz-livereload" = .{
-    .url = "git+https://github.com/erwagasore/httpz-livereload.git?ref=main#COMMIT",
+    .url = "git+https://github.com/erwagasore/httpz-livereload#COMMIT",
     .hash = "...",
 },
 ```

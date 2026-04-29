@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Other
+
+- Upgrade the minimum Zig version to 0.16.0.
+- Update httpz to the latest upstream revision and adapt the middleware,
+  tests, and example server to Zig 0.16/httpz API changes.
+- Add configurable `std.Io` support for Zig 0.16 blocking filesystem,
+  sleep, and synchronization operations.
+- Tighten middleware memory management by copying configured paths,
+  tracking background workers, and making shutdown joins responsive.
+
 ## [0.5.1] — 2026-03-12
 
 ### Fixes

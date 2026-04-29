@@ -2,21 +2,18 @@ const std = @import("std");
 const httpz = @import("httpz");
 const LiveReload = @import("httpz-livereload");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var server = try httpz.Server(void).init(allocator, .{
-        .port = 3131,
-        .address = "127.0.0.1",
+    var server = try httpz.Server(void).init(init.io, allocator, .{
+        .address = .localhost(3131),
     }, {});
     defer {
         server.stop();
         server.deinit();
     }
 
-    const livereload = try server.middleware(LiveReload, .{});
+    const livereload = try server.middleware(LiveReload, .{ .io = init.io });
 
     var r = try server.router(.{ .middlewares = &.{livereload} });
     r.get("/", index, .{});

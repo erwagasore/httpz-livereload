@@ -50,4 +50,4 @@ Use [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **Entry point**: `src/root.zig` — single-file httpz middleware.
 - **Domain**: dev-only browser reload middleware for the httpz web framework.
-- **Stack**: Zig 0.15.2, httpz.
+- **Stack**: Zig 0.16.x, httpz.
