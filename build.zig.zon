@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xdd15a15d3c5bbb88,
     .name = .httpz_livereload,
-    .version = "0.5.1",
+    .version = "0.6.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .httpz = .{
