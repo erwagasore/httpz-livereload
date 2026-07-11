@@ -14,14 +14,13 @@ Requires Zig 0.16.0 or newer and the current httpz API.
    [EventSource](https://developer.mozilla.org/en-US/docs/Web/API/EventSource)
    to `/_livereload`.
 2. The SSE endpoint sends `event: init`, then holds the connection open.
-3. The middleware detects restarts two ways:
-   - **Process restart**: SSE connections drop. The browser reconnects, sees a
-     new `init` event, and reloads.
-   - **Binary change**: a background thread watches the server executable on
-     disk. When it changes, the process exits so it can restart with new code;
-     browsers reload after reconnecting to the new server.
+3. When the server restarts, SSE connections drop. The browser reconnects,
+   sees a new `init` event, and reloads.
 4. For explicit reloads without restart (e.g. content file changes), call
    `reload()` from application code.
+
+The middleware never rebuilds, restarts, or exits the host process. Applications
+that reload compiled code should put that policy in a development supervisor.
 
 ## Usage
 
@@ -38,54 +37,54 @@ var r = try server.router(.{ .middlewares = &.{ livereload } });
 
 ## Dev workflows
 
-### `zig build --watch` + restart loop
+Rebuilding Zig source requires a process supervisor: the running program cannot
+load newly compiled code into itself. `LiveReload.Supervisor` provides that
+capability separately from the middleware contract.
 
-No extra tools needed. The binary watcher detects rebuilds and exits the
-server so the loop restarts it:
+At application startup, marked children run the HTTP server normally; the
+unmarked parent configures and runs the supervisor:
 
-```bash
-# Terminal 1 — continuously recompile
-zig build --watch
+```zig
+if (LiveReload.Supervisor.isChild(init.environ_map)) {
+    return runHttpServer(init);
+}
 
-# Terminal 2 — run server, restart on exit
-while zig-out/bin/server; do sleep 0.1; done
+return LiveReload.Supervisor.run(.{
+    .allocator = init.gpa,
+    .io = init.io,
+    .cwd = .cwd(),
+    .env = init.environ_map,
+    // Required when the parent was launched by `zig build run`, whose running
+    // artifact is not the installed replacement produced by the nested build.
+    .executable_path = "zig-out/bin/my-app",
+    .rebuild = .{
+        .paths = &.{ "src", "build.zig", "build.zig.zon" },
+    },
+    .restart_paths = &.{"configuration"},
+});
 ```
 
-### watchexec (single terminal)
+The supervisor polls watched paths (100ms by default), debounces change batches
+for 50ms, inherits child/build stdio, and returns the final child exit code.
+On POSIX, children receive SIGTERM and are sent SIGKILL after one second by
+default; configure this with `shutdown_grace_ms`. Windows children are
+terminated immediately.
+Rebuilds are transactional: the current child keeps serving while the replacement
+build runs, failed builds leave it untouched, and edits arriving during a build
+schedule another serialized build before the child is swapped. It never invokes
+`process.exit()`.
+
+Use `rebuild.paths` only for compiled inputs and `restart_paths` for changes
+that require reconstructing process state. The subsystem that owns runtime
+files should own their watcher and call `reload()` when those files change. For
+example, a static-file middleware can invalidate its cache and signal the
+livereload handle from one authoritative watcher.
+
+Alternatively, applications can use an external supervisor:
 
 ```bash
 watchexec -r -e zig,md,css,js -- zig build run
 ```
-
-### Directory watching
-
-Watch content or static directories for changes — the middleware detects
-file modifications and reloads all connected browsers automatically:
-
-```zig
-const livereload = try server.middleware(LiveReload, .{ .io = init.io, .watch = false });
-const lr = LiveReload.from(livereload);
-
-// Static files: just reload browsers on change
-lr.watchDir("static", .{});
-
-// Content files: run a callback before reloading (e.g. re-parse markdown)
-lr.watchDir("content", .{
-    .poll_ns = 50 * std.time.ns_per_ms,  // check every 50ms
-    .on_change = .{
-        .cb = &struct {
-            fn f(ctx: *anyopaque) !void {
-                const app: *App = @ptrCast(@alignCast(ctx));
-                try app.reloadContent();
-            }
-        }.f,
-        .ctx = @ptrCast(app),
-    },
-});
-```
-
-Each call spawns a lightweight background thread. Default poll interval
-is 50ms.
 
 ### Manual reload
 
@@ -103,27 +102,19 @@ lr.reload();  // all connected browsers reload
 
 ```zig
 const livereload = try server.middleware(LiveReload, .{
-    .path = "/_livereload",            // SSE endpoint path
-    .watch = true,                     // watch own binary for changes
-    .watch_interval_ns = 500_000_000,  // check every 500ms
-    .retry_ms = 50,                    // browser reconnect interval (ms)
-    .io = init.io,                     // Zig 0.16 I/O implementation
+    .path = "/_livereload",  // SSE endpoint path
+    .retry_ms = 50,          // browser reconnect interval (ms)
+    .io = init.io,           // Zig 0.16 I/O implementation
 });
 ```
-
-Set `.watch = false` to disable the binary watcher (e.g. when using
-`watchexec` which handles restarts itself).
 
 ## Example
 
 ```bash
-# Build and run the example server
+# Either form supports supervised rebuilds.
 zig build run
+# or: zig build && ./zig-out/bin/example
 # → http://127.0.0.1:3131
-
-# Or with zig build --watch:
-zig build --watch &
-while zig-out/bin/example; do sleep 0.1; done
 ```
 
 ## Install
@@ -156,9 +147,14 @@ Same pattern, adapted for Zig and httpz:
 | Framework | tower / axum / hyper | httpz |
 | SSE mechanism | Async streaming body | `res.startEventStream` (thread per SSE) |
 | Script injection | Response body wrapper | Append to `res.body` / writer in middleware |
-| Restart detection | SSE connection drop + reconnect | SSE reconnect + binary self-watch |
+| Restart detection | SSE connection drop + reconnect | SSE connection drop + reconnect |
 | Manual reload | `Reloader::reload()` via `tokio::Notify` | `lr.reload()` via Mutex + Condition |
 | Heuristic | `Content-Type: text/html` | `res.content_type == .HTML` |
+
+## Architecture
+
+See [SPEC.md](SPEC.md) for the middleware, filesystem-ownership, supervision,
+and teardown contracts.
 
 ## License
 

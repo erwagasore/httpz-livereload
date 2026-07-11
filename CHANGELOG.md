@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Breaking Changes
+
+- Remove executable/directory watching and the `Config.watch`,
+  `watch_interval_ns`, `watchDir`, `WatchDirOpts`, and `OnChangeFn` APIs. The
+  middleware no longer exits its host process or owns application filesystems;
+  file-owning subsystems signal browsers through `reload()`.
+
+### Features
+
+- Add the separate, reusable `LiveReload.Supervisor` API for configurable file
+  watching, debounced and serialized rebuilds, and child restart lifecycle
+  without coupling process policy to the httpz middleware contract. Replacement
+  builds complete before the current child is stopped; failed builds leave it
+  serving.
+
+### Fixes
+
+- Reserve SSE writers before spawning their detached threads so middleware
+  teardown cannot free the server arena before a newly spawned writer starts.
+- Preserve restart-only changes observed during failed rebuilds, safely launch
+  a replacement when a child exits during a rebuild, and escalate child
+  shutdown after a bounded grace period instead of waiting indefinitely.
+
 ## [0.6.0] — 2026-04-29
 
 ### Other
