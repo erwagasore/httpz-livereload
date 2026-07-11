@@ -88,7 +88,7 @@ or the parent supervisor.
 - optional rebuild paths and rebuild command; the default is `zig build` and
   works both directly and under an enclosing `zig build run`;
 - restart-only paths;
-- polling and debounce intervals.
+- polling, debounce, and child shutdown grace intervals.
 
 The supervisor clones the environment, adds its internal child marker, inherits
 child/build stdio, and returns the final child exit code. It never calls
@@ -113,6 +113,8 @@ child/build stdio, and returns the final child exit code. It never calls
   the child is replaced.
 - Once a stable build succeeds, the supervisor stops and joins the old child,
   then starts the replacement.
+- On POSIX, child shutdown escalates from SIGTERM to SIGKILL after the
+  configured grace interval. Windows children are terminated immediately.
 
 These rules minimize browser downtime and prevent half-written editor saves or
 concurrent rebuilds from producing inconsistent replacement processes.

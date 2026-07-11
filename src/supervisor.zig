@@ -13,6 +13,7 @@ const log = std.log.scoped(.livereload_supervisor);
 pub const child_marker = "HTTPZ_LIVERELOAD_CHILD";
 pub const default_poll_interval_ms = 100;
 pub const default_debounce_ms = 50;
+pub const default_shutdown_grace_ms = 1_000;
 
 pub const Rebuild = struct {
     /// Files and directory trees whose changes require rebuilding the child.
@@ -40,6 +41,9 @@ pub const Config = struct {
     poll_interval_ms: u32 = default_poll_interval_ms,
     /// Required quiet window after a detected change before taking action.
     debounce_ms: u32 = default_debounce_ms,
+    /// On POSIX, time allowed for a child to exit after SIGTERM before SIGKILL.
+    /// Windows children are terminated immediately.
+    shutdown_grace_ms: u32 = default_shutdown_grace_ms,
 };
 
 pub fn isChild(env: *const std.process.Environ.Map) bool {
@@ -87,8 +91,7 @@ pub fn run(config: Config) !u8 {
                     .fromMilliseconds(config.poll_interval_ms),
                     .awake,
                 ) catch |err| {
-                    requestStop(child_id);
-                    wait_thread.join();
+                    stopAndJoin(config, child_id, &monitor, wait_thread);
                     return err;
                 };
                 const current = snapshot(config);
@@ -99,8 +102,7 @@ pub fn run(config: Config) !u8 {
             };
 
             const settled = settleSnapshot(config, first_change) catch |err| {
-                requestStop(child_id);
-                wait_thread.join();
+                stopAndJoin(config, child_id, &monitor, wait_thread);
                 return err;
             };
             const change = settled.changeFrom(previous) orelse {
@@ -116,8 +118,7 @@ pub fn run(config: Config) !u8 {
                         const build_baseline = previous;
                         log.info("watched source changed; rebuilding replacement", .{});
                         const succeeded = runCommand(config, rebuild.command) catch |err| {
-                            requestStop(child_id);
-                            wait_thread.join();
+                            stopAndJoin(config, child_id, &monitor, wait_thread);
                             return err;
                         };
                         const after_build = snapshot(config);
@@ -126,12 +127,24 @@ pub fn run(config: Config) !u8 {
                         if (!succeeded) {
                             log.warn("build failed; keeping current child running", .{});
                             if (monitor.done.load(.acquire)) {
+                                // The child exited while the build was running.
+                                // Re-enter the outer loop so the last known-good
+                                // executable is brought back while we wait for
+                                // the next source change.
                                 wait_thread.join();
-                                return monitor.exitCode();
+                                break :child_lifetime;
                             }
                             // If source changed during the failed build, retry
-                            // immediately; otherwise wait for the next edit.
-                            if (after_build.rebuild != build_baseline.rebuild) continue;
+                            // immediately. A concurrent runtime change must not
+                            // disappear into the updated snapshot baseline.
+                            if (after_build.changeFrom(build_baseline)) |pending| switch (pending) {
+                                .rebuild => continue,
+                                .restart => {
+                                    log.info("watched runtime files changed; restarting child", .{});
+                                    stopAndJoin(config, child_id, &monitor, wait_thread);
+                                    break :child_lifetime;
+                                },
+                            };
                             continue :child_lifetime;
                         }
 
@@ -140,14 +153,12 @@ pub fn run(config: Config) !u8 {
                         if (after_build.rebuild != build_baseline.rebuild) continue;
                         break;
                     }
-                    requestStop(child_id);
-                    wait_thread.join();
+                    stopAndJoin(config, child_id, &monitor, wait_thread);
                     break :child_lifetime;
                 },
                 .restart => {
                     log.info("watched runtime files changed; restarting child", .{});
-                    requestStop(child_id);
-                    wait_thread.join();
+                    stopAndJoin(config, child_id, &monitor, wait_thread);
                     break :child_lifetime;
                 },
             }
@@ -196,15 +207,63 @@ fn spawn(
     });
 }
 
-fn requestStop(child_id: std.process.Child.Id) void {
-    if (comptime builtin.os.tag == .windows) {
-        _ = std.os.windows.ntdll.NtTerminateProcess(child_id, .SUCCESS);
-    } else {
-        std.posix.kill(child_id, .TERM) catch |err| switch (err) {
-            error.ProcessNotFound => {},
-            else => {},
+fn stopAndJoin(
+    config: Config,
+    child_id: std.process.Child.Id,
+    monitor: *const ChildMonitor,
+    wait_thread: std.Thread,
+) void {
+    if (monitor.done.load(.acquire)) {
+        wait_thread.join();
+        return;
+    }
+
+    requestStop(child_id) catch |err| {
+        log.warn("could not request child shutdown: {}; forcing termination", .{err});
+        forceStop(child_id) catch |force_err| {
+            log.err("could not terminate child: {}", .{force_err});
+        };
+        wait_thread.join();
+        return;
+    };
+
+    const sleep_ms: u32 = 10;
+    var remaining = config.shutdown_grace_ms;
+    while (remaining > 0 and !monitor.done.load(.acquire)) {
+        const delay = @min(remaining, sleep_ms);
+        std.Io.sleep(config.io, .fromMilliseconds(delay), .awake) catch break;
+        remaining -= delay;
+    }
+
+    if (!monitor.done.load(.acquire)) {
+        log.warn("child did not stop within {d}ms; forcing termination", .{config.shutdown_grace_ms});
+        forceStop(child_id) catch |err| {
+            log.err("could not terminate child: {}", .{err});
         };
     }
+    wait_thread.join();
+}
+
+fn requestStop(child_id: std.process.Child.Id) !void {
+    if (comptime builtin.os.tag == .windows) return forceStop(child_id);
+    std.posix.kill(child_id, .TERM) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => return err,
+    };
+}
+
+fn forceStop(child_id: std.process.Child.Id) !void {
+    if (comptime builtin.os.tag == .windows) {
+        return switch (std.os.windows.ntdll.NtTerminateProcess(child_id, .SUCCESS)) {
+            .SUCCESS, .PROCESS_IS_TERMINATING => {},
+            .ACCESS_DENIED => error.AccessDenied,
+            else => error.Unexpected,
+        };
+    }
+    std.posix.kill(child_id, .KILL) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => return err,
+    };
 }
 
 fn runCommand(config: Config, argv: []const []const u8) !bool {

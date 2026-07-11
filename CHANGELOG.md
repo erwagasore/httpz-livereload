@@ -21,6 +21,9 @@
 
 - Reserve SSE writers before spawning their detached threads so middleware
   teardown cannot free the server arena before a newly spawned writer starts.
+- Preserve restart-only changes observed during failed rebuilds, safely launch
+  a replacement when a child exits during a rebuild, and escalate child
+  shutdown after a bounded grace period instead of waiting indefinitely.
 
 ## [0.6.0] — 2026-04-29
 

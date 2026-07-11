@@ -54,7 +54,6 @@ return LiveReload.Supervisor.run(.{
     .io = init.io,
     .cwd = .cwd(),
     .env = init.environ_map,
-    .child_args = argv[1..],
     // Required when the parent was launched by `zig build run`, whose running
     // artifact is not the installed replacement produced by the nested build.
     .executable_path = "zig-out/bin/my-app",
@@ -67,6 +66,9 @@ return LiveReload.Supervisor.run(.{
 
 The supervisor polls watched paths (100ms by default), debounces change batches
 for 50ms, inherits child/build stdio, and returns the final child exit code.
+On POSIX, children receive SIGTERM and are sent SIGKILL after one second by
+default; configure this with `shutdown_grace_ms`. Windows children are
+terminated immediately.
 Rebuilds are transactional: the current child keeps serving while the replacement
 build runs, failed builds leave it untouched, and edits arriving during a build
 schedule another serialized build before the child is swapped. It never invokes
