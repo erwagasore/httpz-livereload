@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixes
+
+- Update httpz to revision `01dc094` for compatibility with the latest middleware ecosystem.
+
 ## [1.0.0] — 2026-07-11
 
 ### Breaking Changes
