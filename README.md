@@ -65,10 +65,12 @@ return LiveReload.Supervisor.run(.{
 ```
 
 The supervisor polls watched paths (100ms by default), debounces change batches
-for 50ms, inherits child/build stdio, and returns the final child exit code.
-On POSIX, children receive SIGTERM and are sent SIGKILL after one second by
-default; configure this with `shutdown_grace_ms`. Windows children are
-terminated immediately.
+for 50ms, and inherits child/build stdio. It returns the final child exit code
+when the child exits independently. On SIGINT, SIGTERM, or a Windows console
+shutdown event, the supervisor stops and joins any active build and server child,
+then returns `0`. On POSIX, children receive SIGTERM and are sent SIGKILL after
+one second by default; configure this with `shutdown_grace_ms`. Windows children
+are terminated immediately.
 Rebuilds are transactional: the current child keeps serving while the replacement
 build runs, failed builds leave it untouched, and edits arriving during a build
 schedule another serialized build before the child is swapped. It never invokes

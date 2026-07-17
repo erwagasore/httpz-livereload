@@ -74,8 +74,14 @@ pub fn run(config: Config) !u8 {
     try child_argv.append(config.allocator, executable_path);
     try child_argv.appendSlice(config.allocator, config.child_args);
 
+    var shutdown: Shutdown = undefined;
+    try shutdown.init();
+    defer shutdown.deinit();
+
     var previous = snapshot(config);
     while (true) {
+        if (shutdown.isRequested()) return 0;
+
         var child = try spawn(config, child_argv.items, &child_env);
         const child_id = child.id.?;
         var monitor: ChildMonitor = .{};
@@ -85,7 +91,16 @@ pub fn run(config: Config) !u8 {
         };
 
         child_lifetime: while (true) {
-            const first_change = while (!monitor.done.load(.acquire)) {
+            const first_change = while (true) {
+                if (shutdown.isRequested()) {
+                    stopAndJoin(config, child_id, &monitor, wait_thread);
+                    return 0;
+                }
+                if (monitor.done.load(.acquire)) {
+                    wait_thread.join();
+                    return monitor.exitCode();
+                }
+
                 std.Io.sleep(
                     config.io,
                     .fromMilliseconds(config.poll_interval_ms),
@@ -96,14 +111,14 @@ pub fn run(config: Config) !u8 {
                 };
                 const current = snapshot(config);
                 if (current.changeFrom(previous) != null) break current;
-            } else {
-                wait_thread.join();
-                return monitor.exitCode();
             };
 
-            const settled = settleSnapshot(config, first_change) catch |err| {
+            const settled = (settleSnapshot(config, first_change, &shutdown) catch |err| {
                 stopAndJoin(config, child_id, &monitor, wait_thread);
                 return err;
+            }) orelse {
+                stopAndJoin(config, child_id, &monitor, wait_thread);
+                return 0;
             };
             const change = settled.changeFrom(previous) orelse {
                 previous = settled;
@@ -117,14 +132,19 @@ pub fn run(config: Config) !u8 {
                     while (true) {
                         const build_baseline = previous;
                         log.info("watched source changed; rebuilding replacement", .{});
-                        const succeeded = runCommand(config, rebuild.command) catch |err| {
+                        const command_result = runCommand(config, rebuild.command, &shutdown) catch |err| {
                             stopAndJoin(config, child_id, &monitor, wait_thread);
                             return err;
                         };
+                        if (command_result == .shutdown) {
+                            stopAndJoin(config, child_id, &monitor, wait_thread);
+                            return 0;
+                        }
+
                         const after_build = snapshot(config);
                         previous = after_build;
 
-                        if (!succeeded) {
+                        if (command_result == .failed) {
                             log.warn("build failed; keeping current child running", .{});
                             if (monitor.done.load(.acquire)) {
                                 // The child exited while the build was running.
@@ -168,6 +188,94 @@ pub fn run(config: Config) !u8 {
         previous = snapshot(config);
     }
 }
+
+const AtomicBool = std.atomic.Value(bool);
+const ActiveRequest = std.atomic.Value(?*AtomicBool);
+
+var active_shutdown_request: ActiveRequest = .init(null);
+
+const Shutdown = struct {
+    requested: AtomicBool = .init(false),
+    old_interrupt: OldAction = undefined,
+    old_terminate: OldAction = undefined,
+
+    const OldAction = if (builtin.os.tag == .windows) void else std.posix.Sigaction;
+
+    fn init(self: *Shutdown) !void {
+        self.* = .{};
+        if (active_shutdown_request.cmpxchgStrong(
+            null,
+            &self.requested,
+            .acq_rel,
+            .acquire,
+        ) != null) return error.ShutdownWatcherAlreadyActive;
+        errdefer _ = active_shutdown_request.swap(null, .acq_rel);
+
+        if (comptime builtin.os.tag == .windows) {
+            if (SetConsoleCtrlHandler(consoleControlHandler, std.os.windows.BOOL.TRUE) == .FALSE) {
+                return error.SignalHandlerUnavailable;
+            }
+            return;
+        }
+
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = posixSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        std.posix.sigaction(.INT, &action, &self.old_interrupt);
+        std.posix.sigaction(.TERM, &action, &self.old_terminate);
+    }
+
+    fn deinit(self: *Shutdown) void {
+        if (comptime builtin.os.tag == .windows) {
+            _ = SetConsoleCtrlHandler(consoleControlHandler, .FALSE);
+        } else {
+            std.posix.sigaction(.INT, &self.old_interrupt, null);
+            std.posix.sigaction(.TERM, &self.old_terminate, null);
+        }
+        const previous = active_shutdown_request.swap(null, .acq_rel);
+        std.debug.assert(previous == &self.requested);
+        self.* = undefined;
+    }
+
+    fn isRequested(self: *const Shutdown) bool {
+        return self.requested.load(.acquire);
+    }
+
+    fn request(self: *Shutdown) void {
+        self.requested.store(true, .release);
+    }
+};
+
+fn requestSupervisorShutdown() void {
+    const requested = active_shutdown_request.load(.acquire) orelse return;
+    requested.store(true, .release);
+}
+
+fn posixSignalHandler(_: std.posix.SIG) callconv(.c) void {
+    requestSupervisorShutdown();
+}
+
+fn consoleControlHandler(control: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
+    return switch (control) {
+        0, // CTRL_C_EVENT
+        1, // CTRL_BREAK_EVENT
+        2, // CTRL_CLOSE_EVENT
+        5, // CTRL_LOGOFF_EVENT
+        6, // CTRL_SHUTDOWN_EVENT
+        => {
+            requestSupervisorShutdown();
+            return std.os.windows.BOOL.TRUE;
+        },
+        else => .FALSE,
+    };
+}
+
+extern "kernel32" fn SetConsoleCtrlHandler(
+    handler: ?*const fn (std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL,
+    add: std.os.windows.BOOL,
+) callconv(.winapi) std.os.windows.BOOL;
 
 const ChildMonitor = struct {
     done: std.atomic.Value(bool) = .init(false),
@@ -266,7 +374,9 @@ fn forceStop(child_id: std.process.Child.Id) !void {
     };
 }
 
-fn runCommand(config: Config, argv: []const []const u8) !bool {
+const CommandResult = enum { succeeded, failed, shutdown };
+
+fn runCommand(config: Config, argv: []const []const u8, shutdown: *const Shutdown) !CommandResult {
     var child = try std.process.spawn(config.io, .{
         .argv = argv,
         .cwd = .{ .dir = config.cwd },
@@ -275,10 +385,31 @@ fn runCommand(config: Config, argv: []const []const u8) !bool {
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(config.io);
-    return switch (term) {
-        .exited => |code| code == 0,
-        else => false,
+    const child_id = child.id.?;
+    var monitor: ChildMonitor = .{};
+    const wait_thread = std.Thread.spawn(.{}, ChildMonitor.wait, .{ &monitor, &child, config.io }) catch |err| {
+        child.kill(config.io);
+        return err;
+    };
+
+    while (!monitor.done.load(.acquire)) {
+        if (shutdown.isRequested()) {
+            stopAndJoin(config, child_id, &monitor, wait_thread);
+            return .shutdown;
+        }
+        try std.Io.sleep(
+            config.io,
+            .fromMilliseconds(config.poll_interval_ms),
+            .awake,
+        );
+    }
+    wait_thread.join();
+
+    if (shutdown.isRequested()) return .shutdown;
+    if (monitor.wait_failed) return error.ChildWaitFailed;
+    return switch (monitor.term) {
+        .exited => |code| if (code == 0) .succeeded else .failed,
+        else => .failed,
     };
 }
 
@@ -312,11 +443,12 @@ fn pathsFingerprint(io: std.Io, cwd: std.Io.Dir, paths: []const []const u8) u64 
     return fingerprint;
 }
 
-fn settleSnapshot(config: Config, initial: Snapshot) !Snapshot {
+fn settleSnapshot(config: Config, initial: Snapshot, shutdown: *const Shutdown) !?Snapshot {
     if (config.debounce_ms == 0) return initial;
 
     var settled = initial;
     while (true) {
+        if (shutdown.isRequested()) return null;
         try std.Io.sleep(
             config.io,
             .fromMilliseconds(config.debounce_ms),
@@ -385,6 +517,24 @@ test "isChild accepts only the supervisor marker" {
     try std.testing.expect(!isChild(&env));
     try env.put(child_marker, "1");
     try std.testing.expect(isChild(&env));
+}
+
+test "Shutdown records programmatic and platform-handler requests" {
+    var shutdown: Shutdown = undefined;
+    try shutdown.init();
+    defer shutdown.deinit();
+
+    try std.testing.expect(!shutdown.isRequested());
+    shutdown.request();
+    try std.testing.expect(shutdown.isRequested());
+
+    shutdown.requested.store(false, .release);
+    if (comptime builtin.os.tag == .windows) {
+        try std.testing.expect(consoleControlHandler(0) == std.os.windows.BOOL.TRUE);
+    } else {
+        posixSignalHandler(.TERM);
+    }
+    try std.testing.expect(shutdown.isRequested());
 }
 
 test "Snapshot prioritizes rebuild changes" {

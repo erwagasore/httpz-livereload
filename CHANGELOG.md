@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixes
+
+- Handle SIGINT, SIGTERM, and Windows console shutdown in the development supervisor, stopping and joining active build and server children instead of orphaning them when only the parent receives the event.
+
 ## [1.0.1] — 2026-07-13
 
 ### Fixes

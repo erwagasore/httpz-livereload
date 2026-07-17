@@ -90,9 +90,11 @@ or the parent supervisor.
 - restart-only paths;
 - polling, debounce, and child shutdown grace intervals.
 
-The supervisor clones the environment, adds its internal child marker, inherits
-child/build stdio, and returns the final child exit code. It never calls
-`std.process.exit`.
+The supervisor clones the environment, adds its internal child marker, and
+inherits child/build stdio. It returns the final child exit code when the child
+exits independently. On SIGINT, SIGTERM, or a Windows console shutdown event,
+it stops and joins active build and server children before returning `0`. It
+never calls `std.process.exit`.
 
 ### Change actions
 
@@ -115,6 +117,9 @@ child/build stdio, and returns the final child exit code. It never calls
   then starts the replacement.
 - On POSIX, child shutdown escalates from SIGTERM to SIGKILL after the
   configured grace interval. Windows children are terminated immediately.
+- Supervisor shutdown signals use that same bounded child lifecycle, including
+  when a replacement build is active, so parent termination cannot orphan a
+  child process.
 
 These rules minimize browser downtime and prevent half-written editor saves or
 concurrent rebuilds from producing inconsistent replacement processes.
