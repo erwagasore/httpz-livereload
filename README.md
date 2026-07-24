@@ -1,8 +1,7 @@
 # httpz-livereload
 
-Browser reload middleware for [httpz](https://github.com/karlseguin/http.zig).
-
-Inspired by [tower-livereload](https://github.com/leotaku/tower-livereload).
+Development-only browser reload middleware for
+[httpz](https://github.com/karlseguin/http.zig).
 
 ## Compatibility
 
@@ -10,112 +9,142 @@ Requires Zig 0.16.0 or newer and the current httpz API.
 
 ## How it works
 
-1. HTML responses get a `<script>` appended that opens an
-   [EventSource](https://developer.mozilla.org/en-US/docs/Web/API/EventSource)
-   to `/_livereload`.
-2. The SSE endpoint sends `event: init`, then holds the connection open.
-3. When the server restarts, SSE connections drop. The browser reconnects,
-   sees a new `init` event, and reloads.
-4. For explicit reloads without restart (e.g. content file changes), call
-   `reload()` from application code.
+1. The middleware appends a polling script to buffered HTML responses.
+2. Each page contains the server's current version.
+3. The script periodically reads the no-store `/_livereload` version endpoint.
+4. A new server process starts with a random version, so browsers reload after a
+   restart.
+5. `reload()` increments the version for changes that do not restart the server,
+   such as updated static files.
 
-The middleware never rebuilds, restarts, or exits the host process. Applications
-that reload compiled code should put that policy in a development supervisor.
+Chunked, disowned, and already encoded responses are left unchanged. Both
+`res.body` and httpz's writer buffer are supported.
 
-## Usage
+## Middleware usage
 
 ```zig
 const LiveReload = @import("httpz-livereload");
 
-// Create the middleware. In Zig 0.16, pass `init.io` from
-// `pub fn main(init: std.process.Init) !void`.
-const livereload = try server.middleware(LiveReload, .{ .io = init.io });
+const middleware = try server.middleware(LiveReload, .{});
 
-// Add to your middleware chain
-var r = try server.router(.{ .middlewares = &.{ livereload } });
+var router = try server.router(.{ .middlewares = &.{middleware} });
 ```
 
-## Dev workflows
+### Manual and static-file reloads
 
-Rebuilding Zig source requires a process supervisor: the running program cannot
-load newly compiled code into itself. `LiveReload.Supervisor` provides that
-capability separately from the middleware contract.
-
-At application startup, marked children run the HTTP server normally; the
-unmarked parent configures and runs the supervisor:
+A subsystem that owns runtime files should watch those files and signal the
+middleware after it has made the new content available:
 
 ```zig
-if (LiveReload.Supervisor.isChild(init.environ_map)) {
-    return runHttpServer(init);
+const live_reload = LiveReload.from(middleware);
+
+// Direct signal:
+live_reload.reload();
+
+// Generic watcher callback, such as httpz-static's:
+const watch: Static.Watch = .{
+    .context = live_reload,
+    .on_change = LiveReload.reloadCallback,
+};
+```
+
+The next browser poll observes the incremented version and reloads. The server
+process does not restart.
+
+## One-command development workflow
+
+Compiled Zig changes require replacing the running executable. The optional
+`LiveReload.Supervisor` keeps `zig build run` as the only command developers
+need to run:
+
+```zig
+pub fn main(init: std.process.Init) !u8 {
+    return LiveReload.Supervisor.run(init, .{
+        .executable_name = "my-app",
+    }, runHttpServer);
 }
-
-return LiveReload.Supervisor.run(.{
-    .allocator = init.gpa,
-    .io = init.io,
-    .cwd = .cwd(),
-    .env = init.environ_map,
-    // Required when the parent was launched by `zig build run`, whose running
-    // artifact is not the installed replacement produced by the nested build.
-    .executable_path = "zig-out/bin/my-app",
-    .rebuild = .{
-        .paths = &.{ "src", "build.zig", "build.zig.zon" },
-    },
-    .restart_paths = &.{"configuration"},
-});
 ```
 
-The supervisor polls watched paths (100ms by default), debounces change batches
-for 50ms, inherits child/build stdio, and returns the final child exit code.
-On POSIX, children receive SIGTERM and are sent SIGKILL after one second by
-default; configure this with `shutdown_grace_ms`. Windows children are
-terminated immediately.
-Rebuilds are transactional: the current child keeps serving while the replacement
-build runs, failed builds leave it untouched, and edits arriving during a build
-schedule another serialized build before the child is swapped. It never invokes
-`process.exit()`.
-
-Use `rebuild.paths` only for compiled inputs and `restart_paths` for changes
-that require reconstructing process state. The subsystem that owns runtime
-files should own their watcher and call `reload()` when those files change. For
-example, a static-file middleware can invalidate its cache and signal the
-livereload handle from one authoritative watcher.
-
-Alternatively, applications can use an external supervisor:
-
-```bash
-watchexec -r -e zig,md,css,js -- zig build run
-```
-
-### Manual reload
-
-Trigger browser reloads from application code without restarting:
+No special build integration is required beyond the usual installed artifact
+and run step:
 
 ```zig
-const livereload = try server.middleware(LiveReload, .{ .io = init.io });
-const lr = LiveReload.from(livereload);
-
-// Later, from a file watcher or other trigger:
-lr.reload();  // all connected browsers reload
+b.installArtifact(exe);
+const run = b.addRunArtifact(exe);
+run.step.dependOn(b.getInstallStep());
+b.step("run", "Run development server").dependOn(&run.step);
 ```
+
+The resulting process tree is:
+
+```text
+zig build run
+└─ supervisor
+   ├─ zig build --watch install --prefix .zig-cache/httpz-livereload/install
+   └─ .zig-cache/httpz-livereload/install/bin/my-app
+```
+
+Zig owns source discovery, filesystem notifications, debouncing, incremental
+compilation, and retries after failed builds. The supervisor watches only the
+installed executable:
+
+- successful install → stop and replace the server;
+- failed build → installed executable remains unchanged and the old server keeps
+  serving;
+- static/runtime file change → owning subsystem calls `reload()` without a
+  restart.
+
+The private install prefix keeps the rebuilt server independent from the outer
+`zig build run` artifact. On Windows, the supervisor additionally runs
+generation-specific copies so the builder can replace its installed `.exe`
+while the old server is running.
+
+`zig build run --watch` is not required and cannot replace this arrangement: a
+long-running `run` step prevents Zig's build runner from reaching its own watch
+loop. The supervisor instead runs the non-blocking `install` step under
+`--watch`.
+
+### Supervisor configuration
+
+```zig
+return LiveReload.Supervisor.run(init, .{
+    .executable_name = "my-app",
+    .child_args = &.{"serve"},
+    .build_args = &.{"-Dconfig=dev"},
+    .poll_interval_ms = 100,
+    .shutdown_grace_ms = 1_000,
+}, runHttpServer);
+```
+
+The builder command and private install prefix are assembled automatically.
+Command-line arguments are forwarded to the server by default; `child_args`
+overrides them. SIGINT, SIGTERM, and Windows console shutdown stop and join both
+children. On POSIX, shutdown
+escalates from SIGTERM to SIGKILL after the configured grace period.
 
 ## Config
 
 ```zig
-const livereload = try server.middleware(LiveReload, .{
-    .path = "/_livereload",  // SSE endpoint path
-    .retry_ms = 50,          // browser reconnect interval (ms)
-    .io = init.io,           // Zig 0.16 I/O implementation
+const middleware = try server.middleware(LiveReload, .{
+    .path = "/_livereload",
+    .poll_interval_ms = 500,
+    .io = init.io,
 });
 ```
+
+`io` is used once to seed the process version. Polling begins only in pages whose
+HTML passed through the mounted middleware; omitting the middleware has no
+runtime cost.
 
 ## Example
 
 ```bash
-# Either form supports supervised rebuilds.
 zig build run
-# or: zig build && ./zig-out/bin/example
 # → http://127.0.0.1:3131
 ```
+
+Edit `example/main.zig`. Zig rebuilds the installed executable, the supervisor
+replaces the server, and the browser reloads after observing the new version.
 
 ## Install
 
@@ -131,30 +160,20 @@ Add to `build.zig.zon`:
 Add to `build.zig`:
 
 ```zig
-const livereload_dep = b.dependency("httpz-livereload", .{
+const dependency = b.dependency("httpz-livereload", .{
     .target = target,
     .optimize = optimize,
 });
-exe.root_module.addImport("httpz-livereload", livereload_dep.module("httpz-livereload"));
+exe.root_module.addImport(
+    "httpz-livereload",
+    dependency.module("httpz-livereload"),
+);
 ```
-
-## How it compares to tower-livereload
-
-Same pattern, adapted for Zig and httpz:
-
-| | tower-livereload (Rust) | httpz-livereload (Zig) |
-|---|---|---|
-| Framework | tower / axum / hyper | httpz |
-| SSE mechanism | Async streaming body | `res.startEventStream` (thread per SSE) |
-| Script injection | Response body wrapper | Append to `res.body` / writer in middleware |
-| Restart detection | SSE connection drop + reconnect | SSE connection drop + reconnect |
-| Manual reload | `Reloader::reload()` via `tokio::Notify` | `lr.reload()` via Mutex + Condition |
-| Heuristic | `Content-Type: text/html` | `res.content_type == .HTML` |
 
 ## Architecture
 
-See [SPEC.md](SPEC.md) for the middleware, filesystem-ownership, supervision,
-and teardown contracts.
+See [SPEC.md](SPEC.md) for the middleware, filesystem-ownership, and supervision
+contracts.
 
 ## License
 

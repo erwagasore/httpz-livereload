@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking Changes
+
+- Replace SSE/EventSource transport with a no-store version endpoint and browser polling. `Config.retry_ms` is replaced by `Config.poll_interval_ms`, and the middleware no longer owns detached threads or requires `deinit` synchronization.
+- Replace configurable supervisor path policies with `Supervisor.run(init, options, child_main)`, requiring only `executable_name`. Remove `Rebuild`, `rebuild`, `restart_paths`, `debounce_ms`, and the public child-marker check.
+
+### Features
+
+- Delegate source discovery, filesystem notifications, debounce, incremental compilation, and failed-build retries to Zig's build runner. The minimal supervisor uses a private install prefix, watches only its executable, and replaces the server after a stable successful install.
+- Run Windows server generations from temporary executable copies so the persistent builder can update its private installed `.exe` without first stopping the server.
+- Add `reloadCallback` for direct integration with generic filesystem watcher callbacks, and forward parent command-line arguments to supervised server children by default.
+
+### Fixes
+
+- Match httpz response serialization when injecting: honor writer-buffer precedence, append to writer output without duplicating it, recognize manual HTML content types, and skip written, chunked, or encoded responses.
+- Handle SIGINT, SIGTERM, and Windows console shutdown in the development supervisor, stopping and joining active builder and server children instead of orphaning them when only the parent receives the event.
+- Reject zero polling intervals and empty supervisor install prefixes instead of producing busy loops or invalid paths.
+
 ## [1.0.1] — 2026-07-13
 
 ### Fixes

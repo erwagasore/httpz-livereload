@@ -1,149 +1,168 @@
 # SPEC — httpz-livereload
 
-Implementation contract for browser reload transport and optional development
-process supervision for httpz applications.
+Implementation contract for browser reload and minimal development process
+supervision for httpz applications.
 
 ## Product boundary
 
-`httpz-livereload` exposes two independent facilities:
+The package exposes two independent facilities:
 
-1. `LiveReload` — an ordinary httpz middleware that injects a browser client,
-   serves an SSE endpoint, and signals reloads.
-2. `LiveReload.Supervisor` — an opt-in development process supervisor that
-   watches application-owned paths, rebuilds compiled inputs, and replaces a
-   child server.
+1. `LiveReload` — an httpz middleware that injects a polling client, serves a
+   version endpoint, and exposes an in-process reload signal.
+2. `LiveReload.Supervisor` — an optional parent process that delegates source
+   watching and rebuilding to `zig build --watch install` and replaces the
+   server when the installed executable changes.
 
-Importing or mounting the middleware never starts the supervisor. Applications
-that only need browser reload transport pay no process-supervision wiring cost.
+Mounting the middleware never starts watchers, builders, threads, or child
+processes.
 
 ## Middleware contract
 
-The root module remains directly mountable with httpz:
-
 ```zig
-const livereload = try server.middleware(LiveReload, .{ .io = init.io });
-const router = try server.router(.{ .middlewares = &.{livereload} });
+const middleware = try server.middleware(LiveReload, .{});
 ```
 
-It follows httpz's middleware lifecycle exactly:
+### Lifecycle and state
 
-- `Config` contains middleware-only settings: SSE `path`, browser `retry_ms`,
-  and the explicit `std.Io` used for synchronization.
-- `init(Config, httpz.MiddlewareConfig)` allocates immutable path/script/SSE
-  bytes from the server arena and returns the middleware value.
-- `execute` short-circuits the configured SSE route; otherwise it calls
-  `executor.next()` once and injects only into HTML responses afterward.
-- `deinit` wakes active SSE writers and waits for them before httpz releases the
-  server arena.
+- `Config` contains the version endpoint path, browser polling interval, and the
+  `std.Io` used to generate the initial process version.
+- `init` copies the path to the server arena and seeds an atomic `u64` version
+  with random bytes.
+- The middleware has no `deinit`: it owns no detached work or resources outside
+  the server arena.
+- `reload()` atomically increments the version.
+- `from(middleware)` recovers the concrete pointer from httpz's type-erased
+  middleware handle.
+- `reloadCallback(context)` adapts the handle to generic watcher callback APIs.
 
-The middleware never watches files, serves static files, rebuilds, restarts,
-spawns, or exits processes. It never calls `std.process.exit`.
+### Request behavior
 
-### Browser reload behavior
+The configured endpoint short-circuits the remaining middleware and returns the
+current hexadecimal version as `text/plain` with `Cache-Control: no-store`.
 
-- The injected script opens an `EventSource` to the configured path.
-- A new connection receives `event: init`.
-- Reconnection after a server restart causes a browser reload.
-- `reload()` broadcasts `event: reload` to connected clients.
-- `from(middleware)` returns the concrete reload handle from httpz's type-erased
-  middleware handle for explicit application integration.
+All other requests call `executor.next()` exactly once. After downstream
+middleware and the handler return, script injection occurs only when:
 
-### SSE ownership and teardown
+- the response has not already been written or switched to chunked transfer;
+- the effective content type is HTML, from either `res.content_type == .HTML` or
+  a case-insensitive manual `Content-Type: text/html...` header;
+- no `Content-Encoding` header is present.
 
-SSE writers run in httpz-managed detached threads and borrow middleware-owned
-arena slices. `serveSSE` reserves an active-writer slot before asking httpz to
-spawn the writer. Spawn failure releases the reservation. The writer releases
-it on every return path. `deinit` sets `stopping`, broadcasts the condition, and
-waits until all reservations are released. This startup handshake prevents
-teardown from missing a spawned-but-not-yet-scheduled writer and freeing its
-borrowed arena first.
+The effective body follows httpz serialization semantics: a non-empty writer
+buffer takes precedence over `res.body`. Injection reserves space and appends
+directly to a non-empty writer buffer, avoiding a copy of the buffered HTML. A
+direct `res.body` is replaced by one exact-size request-arena allocation.
+Allocation failure logs a warning and preserves the original response.
 
-## Filesystem ownership and middleware composition
+### Browser behavior
 
-A subsystem that owns files owns their watcher:
+The script contains the version current when its HTML response was generated.
+It polls the configured endpoint with `cache: "no-store"` after each configured
+interval. A different successful version response reloads the page. Failed
+requests retry without reloading.
 
-- A future `httpz-static` owns static file serving, cache invalidation, and its
-  static-root watcher.
-- A content subsystem owns content parsing/cache invalidation and its watcher.
-- Those subsystems remain independent of `httpz-livereload` and expose generic
-  change callbacks or events.
-- Applications may connect those events to `LiveReload.reload()`.
+A restarted process has a new random version. An in-process `reload()` changes
+the current version. Newly loaded pages receive the current version, preventing
+reload loops.
 
-There must be only one authoritative watcher per filesystem tree. The
-livereload middleware does not duplicate watchers owned by static/content
-middleware and does not depend on those packages.
+## Filesystem ownership
 
-## Supervisor contract
+The livereload middleware never watches files.
 
-`LiveReload.Supervisor` is separate from the middleware lifecycle. The caller
-checks `Supervisor.isChild(env)` before deciding whether to run the HTTP server
-or the parent supervisor.
+- Static middleware owns static roots, cache invalidation, and static change
+  detection.
+- Content subsystems own their source trees and parsed state.
+- After making changed runtime content available, an owning subsystem may call
+  `LiveReload.reload()`.
+- There is one authoritative watcher per filesystem tree.
 
-`Supervisor.Config` receives explicit runtime dependencies and policy:
+## Minimal supervisor contract
 
-- allocator, `std.Io`, working directory, and environment;
-- optional child executable and child arguments; applications launched through
-  `zig build run` set the executable to their installed `zig-out/bin/...` path
-  because the running cache artifact is not replaced by a nested build;
-- optional rebuild paths and rebuild command; the default is `zig build` and
-  works both directly and under an enclosing `zig build run`;
-- restart-only paths;
-- polling, debounce, and child shutdown grace intervals.
+The parent/child marker remains internal. `Supervisor.run(init, options,
+child_main)` invokes `child_main` in marked server children and otherwise runs
+the parent supervisor:
 
-The supervisor clones the environment, adds its internal child marker, inherits
-child/build stdio, and returns the final child exit code. It never calls
-`std.process.exit`.
+```zig
+return LiveReload.Supervisor.run(init, .{
+    .executable_name = "my-app",
+}, runHttpServer);
+```
 
-### Change actions
+`std.process.Init` supplies the allocator, I/O implementation, environment, and
+parent command-line arguments. `executable_name` is the only required option;
+`child_args` may override automatic argument forwarding. Normal
+`installArtifact` and `addRunArtifact` build integration remains supported.
 
-- **Rebuild paths** identify compiled inputs. Their changes run the configured
-  build command and replace the child only after success.
-- **Restart paths** identify runtime inputs that require process-state
-  reconstruction but no build.
-- Reload-only runtime files do not belong in supervisor policy when their
-  owning subsystem can reread them; that subsystem signals `reload()` directly.
+### Builder ownership
 
-### Transactional rebuild semantics
+The supervisor starts one persistent builder:
 
-- Filesystem changes settle for the configured debounce window.
-- Only one build/restart action runs at a time.
-- The current child continues serving while a replacement build runs.
-- A failed build leaves the current child running.
-- A change observed during a build schedules another serialized build before
-  the child is replaced.
-- Once a stable build succeeds, the supervisor stops and joins the old child,
-  then starts the replacement.
-- On POSIX, child shutdown escalates from SIGTERM to SIGKILL after the
-  configured grace interval. Windows children are terminated immediately.
+```text
+zig build --watch install --prefix .zig-cache/httpz-livereload/install
+```
 
-These rules minimize browser downtime and prevent half-written editor saves or
-concurrent rebuilds from producing inconsistent replacement processes.
+Zig's build runner owns:
 
-## API ergonomics
+- source-input discovery;
+- filesystem notifications and debounce;
+- incremental compilation;
+- serialization of rebuilds;
+- recovery after failed builds;
+- installation after successful builds.
 
-- Middleware registration remains one normal `server.middleware` call.
-- Supervisor setup occurs once per application, never once per middleware.
-- Middleware packages do not acquire hidden global process or filesystem
-  ownership.
-- Runtime dependencies and watched paths remain explicit and testable.
-- An external supervisor such as `watchexec` remains supported; applications
-  can mount only the middleware and omit `Supervisor` entirely.
+The supervisor does not accept rebuild paths, restart-only paths, or a custom
+builder command. `build_args` appends project-specific `-D` options. A private
+install prefix keeps the watched server executable independent from the outer
+`zig build run` artifact.
 
-## Out of scope
+### Replacement behavior
 
-- Static file serving and cache policy.
-- Content parsing or cache ownership.
-- Framework-specific HMR/module replacement.
-- Browser build-error overlays.
-- A global event bus shared implicitly by unrelated middleware.
+- The supervisor waits for the first successful private installation, then
+  starts the server.
+- The supervisor fingerprints only that executable.
+- A changed fingerprint must remain stable for one polling interval.
+- After a stable change, the old server is stopped and joined before the new
+  server starts.
+- A failed build leaves the installed executable unchanged, so the current
+  server continues serving.
+- If the server exits independently, its exit code is returned and the builder
+  is stopped.
+- If the persistent builder exits, its exit code is returned and the server is
+  stopped.
+- On Windows, each server generation runs from a temporary copy so the builder
+  can replace the private installed `.exe` while the old generation runs.
+
+### Shutdown
+
+SIGINT, SIGTERM, and Windows console shutdown request supervisor termination.
+Both builder and server children are stopped and joined before `run` returns
+`0`. POSIX children receive SIGTERM and are force-killed after
+`shutdown_grace_ms`; Windows children are terminated immediately.
+
+The supervisor never calls `std.process.exit`.
+
+## Explicit exclusions
+
+The package does not provide:
+
+- SSE or persistent browser connections;
+- file or directory watching in the middleware;
+- custom rebuild/restart path classification;
+- content parsing or static serving;
+- framework-specific HMR;
+- browser build-error overlays;
+- a general-purpose process supervisor.
 
 ## Validation
 
-The project must keep:
+The project must keep tests for:
 
-- middleware init/injection/pass-through tests;
-- SSE reservation and teardown regression coverage;
-- supervisor marker, snapshot priority, and snapshot stability tests;
-- Debug and ReleaseSafe test builds;
-- an example that mounts the middleware normally, opts into the supervisor at
-  the application boundary, and works both directly and through `zig build run`.
+- version initialization and explicit reload;
+- version endpoint short-circuiting and cache policy;
+- direct-body and writer-buffer injection;
+- writer-buffer precedence;
+- manual HTML content types;
+- written, chunked, encoded, and non-HTML pass-through;
+- supervisor option validation, child marker, and shutdown state;
+- Debug and ReleaseSafe builds;
+- the one-command example using the installed executable.

@@ -3,23 +3,9 @@ const httpz = @import("httpz");
 const LiveReload = @import("httpz-livereload");
 
 pub fn main(init: std.process.Init) !u8 {
-    if (LiveReload.Supervisor.isChild(init.environ_map)) {
-        try runServer(init);
-        return 0;
-    }
-
-    return LiveReload.Supervisor.run(.{
-        .allocator = init.gpa,
-        .io = init.io,
-        .cwd = .cwd(),
-        .env = init.environ_map,
-        // `zig build run` executes a cache artifact; replacements should use
-        // the freshly installed binary instead.
-        .executable_path = "zig-out/bin/example",
-        .rebuild = .{
-            .paths = &.{ "src", "example", "build.zig", "build.zig.zon" },
-        },
-    });
+    return LiveReload.Supervisor.run(init, .{
+        .executable_name = "example",
+    }, runServer);
 }
 
 fn runServer(init: std.process.Init) !void {
@@ -31,7 +17,7 @@ fn runServer(init: std.process.Init) !void {
         server.deinit();
     }
 
-    const livereload = try server.middleware(LiveReload, .{ .io = init.io });
+    const livereload = try server.middleware(LiveReload, .{});
 
     var router = try server.router(.{ .middlewares = &.{livereload} });
     router.get("/", index, .{});
