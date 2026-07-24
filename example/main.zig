@@ -3,9 +3,7 @@ const httpz = @import("httpz");
 const LiveReload = @import("httpz-livereload");
 
 pub fn main(init: std.process.Init) !u8 {
-    return LiveReload.Supervisor.run(init, .{
-        .executable_name = "example",
-    }, runServer);
+    return LiveReload.Supervisor.run(init, .{}, runServer);
 }
 
 fn runServer(init: std.process.Init) !void {

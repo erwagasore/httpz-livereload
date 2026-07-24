@@ -12,27 +12,12 @@ const log = std.log.scoped(.livereload_supervisor);
 
 const child_marker = "HTTPZ_LIVERELOAD_CHILD";
 const default_install_prefix = ".zig-cache/httpz-livereload/install";
-const default_poll_interval_ms = 100;
-const default_shutdown_grace_ms = 1_000;
+const default_poll_interval_ms: u32 = 100;
+const default_shutdown_grace_ms: u32 = 1_000;
 
-/// Development-loop policy. Runtime dependencies come directly from
-/// `std.process.Init` so applications only configure project-specific values.
+/// Additional options passed to `zig build --watch install`.
 pub const Options = struct {
-    /// Filename installed into the private development prefix's `bin` directory.
-    /// Windows accepts the name with or without `.exe`.
-    executable_name: []const u8,
-    /// Arguments passed to the server child. Null forwards the parent process's
-    /// arguments after argv[0].
-    child_args: ?[]const []const u8 = null,
-    /// Additional options passed to `zig build --watch install`.
     build_args: []const []const u8 = &.{},
-    /// Private install prefix kept separate from the outer `zig build run`.
-    install_prefix: []const u8 = default_install_prefix,
-    /// Interval used to observe a stable installed executable.
-    poll_interval_ms: u32 = default_poll_interval_ms,
-    /// On POSIX, time allowed for a child to exit after SIGTERM before SIGKILL.
-    /// Windows children are terminated immediately.
-    shutdown_grace_ms: u32 = default_shutdown_grace_ms,
 };
 
 const Config = struct {
@@ -43,8 +28,6 @@ const Config = struct {
     executable_path: []const u8,
     child_args: []const []const u8,
     builder_argv: []const []const u8,
-    poll_interval_ms: u32,
-    shutdown_grace_ms: u32,
 };
 
 /// Run `child_main` directly in marked server children; otherwise enter the
@@ -58,14 +41,18 @@ pub fn run(
         try child_main(init);
         return 0;
     }
-    try validate(options);
-
-    const executable_suffix = if (builtin.os.tag == .windows and
-        !std.ascii.endsWithIgnoreCase(options.executable_name, ".exe")) ".exe" else "";
+    var running_executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const running_executable_len = try std.process.executablePath(
+        init.io,
+        &running_executable_buffer,
+    );
+    const executable_name = std.fs.path.basename(
+        running_executable_buffer[0..running_executable_len],
+    );
     const executable_path = try std.fmt.allocPrint(
         init.gpa,
-        "{s}/bin/{s}{s}",
-        .{ options.install_prefix, options.executable_name, executable_suffix },
+        "{s}/bin/{s}",
+        .{ default_install_prefix, executable_name },
     );
     defer init.gpa.free(executable_path);
 
@@ -75,7 +62,7 @@ pub fn run(
     defer args_iterator.deinit();
     _ = args_iterator.skip();
     while (args_iterator.next()) |arg| try forwarded_args.append(init.gpa, arg);
-    const child_args = options.child_args orelse forwarded_args.items;
+    const child_args = forwarded_args.items;
 
     var builder_argv: std.ArrayList([]const u8) = .empty;
     defer builder_argv.deinit(init.gpa);
@@ -85,7 +72,7 @@ pub fn run(
         "--watch",
         "install",
         "--prefix",
-        options.install_prefix,
+        default_install_prefix,
     });
     try builder_argv.appendSlice(init.gpa, options.build_args);
 
@@ -97,19 +84,11 @@ pub fn run(
         .executable_path = executable_path,
         .child_args = child_args,
         .builder_argv = builder_argv.items,
-        .poll_interval_ms = options.poll_interval_ms,
-        .shutdown_grace_ms = options.shutdown_grace_ms,
     });
 }
 
 fn isChild(env: *const std.process.Environ.Map) bool {
     return std.mem.eql(u8, env.get(child_marker) orelse return false, "1");
-}
-
-fn validate(options: Options) !void {
-    if (options.executable_name.len == 0) return error.EmptyExecutableName;
-    if (options.install_prefix.len == 0) return error.EmptyInstallPrefix;
-    if (options.poll_interval_ms == 0) return error.InvalidPollInterval;
 }
 
 /// Run the persistent Zig builder and a marked server child.
@@ -132,7 +111,7 @@ fn supervise(config: Config) !u8 {
         break executableFingerprint(config) catch |err| switch (err) {
             error.FileNotFound => {
                 try config.io.sleep(
-                    .fromMilliseconds(config.poll_interval_ms),
+                    .fromMilliseconds(default_poll_interval_ms),
                     .awake,
                 );
                 continue;
@@ -189,7 +168,7 @@ fn supervise(config: Config) !u8 {
             if (server.isDone()) return server.exitCode();
 
             try config.io.sleep(
-                .fromMilliseconds(config.poll_interval_ms),
+                .fromMilliseconds(default_poll_interval_ms),
                 .awake,
             );
 
@@ -346,7 +325,7 @@ const ManagedChild = struct {
         };
 
         const sleep_ms: u32 = 10;
-        var remaining = config.shutdown_grace_ms;
+        var remaining = default_shutdown_grace_ms;
         while (remaining > 0 and !self.isDone()) {
             const delay = @min(remaining, sleep_ms);
             config.io.sleep(.fromMilliseconds(delay), .awake) catch break;
@@ -356,7 +335,7 @@ const ManagedChild = struct {
         if (!self.isDone()) {
             log.warn(
                 "child did not stop within {d}ms; forcing termination",
-                .{config.shutdown_grace_ms},
+                .{default_shutdown_grace_ms},
             );
             forceStop(config, self.process_id) catch |err| {
                 log.err("could not terminate child: {}", .{err});
@@ -508,20 +487,6 @@ test "isChild accepts only the supervisor marker" {
     try testing.expect(!isChild(&env));
     try env.put(child_marker, "1");
     try testing.expect(isChild(&env));
-}
-
-test "options reject empty names prefixes and polling intervals" {
-    try testing.expectError(error.EmptyExecutableName, validate(.{
-        .executable_name = "",
-    }));
-    try testing.expectError(error.EmptyInstallPrefix, validate(.{
-        .executable_name = "app",
-        .install_prefix = "",
-    }));
-    try testing.expectError(error.InvalidPollInterval, validate(.{
-        .executable_name = "app",
-        .poll_interval_ms = 0,
-    }));
 }
 
 test "Shutdown records requests and rejects overlap" {

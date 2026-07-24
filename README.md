@@ -59,9 +59,7 @@ need to run:
 
 ```zig
 pub fn main(init: std.process.Init) !u8 {
-    return LiveReload.Supervisor.run(init, .{
-        .executable_name = "my-app",
-    }, runHttpServer);
+    return LiveReload.Supervisor.run(init, .{}, runHttpServer);
 }
 ```
 
@@ -106,21 +104,20 @@ loop. The supervisor instead runs the non-blocking `install` step under
 
 ### Supervisor configuration
 
+Most applications use an empty options struct. Projects with build options pass
+them through `build_args`:
+
 ```zig
 return LiveReload.Supervisor.run(init, .{
-    .executable_name = "my-app",
-    .child_args = &.{"serve"},
     .build_args = &.{"-Dconfig=dev"},
-    .poll_interval_ms = 100,
-    .shutdown_grace_ms = 1_000,
 }, runHttpServer);
 ```
 
-The builder command and private install prefix are assembled automatically.
-Command-line arguments are forwarded to the server by default; `child_args`
-overrides them. SIGINT, SIGTERM, and Windows console shutdown stop and join both
-children. On POSIX, shutdown
-escalates from SIGTERM to SIGKILL after the configured grace period.
+The executable name, builder command, private install prefix, polling interval,
+and shutdown policy are derived or fixed internally. Command-line arguments are
+forwarded to the server. SIGINT, SIGTERM, and Windows console shutdown stop and
+join both children; POSIX shutdown escalates from SIGTERM to SIGKILL after one
+second.
 
 ## Config
 

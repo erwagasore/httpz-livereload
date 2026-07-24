@@ -83,15 +83,14 @@ child_main)` invokes `child_main` in marked server children and otherwise runs
 the parent supervisor:
 
 ```zig
-return LiveReload.Supervisor.run(init, .{
-    .executable_name = "my-app",
-}, runHttpServer);
+return LiveReload.Supervisor.run(init, .{}, runHttpServer);
 ```
 
-`std.process.Init` supplies the allocator, I/O implementation, environment, and
-parent command-line arguments. `executable_name` is the only required option;
-`child_args` may override automatic argument forwarding. Normal
+`std.process.Init` supplies the allocator, I/O implementation, environment,
+parent command-line arguments, and running executable name. Normal
 `installArtifact` and `addRunArtifact` build integration remains supported.
+`build_args` is the only policy option and appends project-specific `-D` values
+to the persistent builder.
 
 ### Builder ownership
 
@@ -111,9 +110,8 @@ Zig's build runner owns:
 - installation after successful builds.
 
 The supervisor does not accept rebuild paths, restart-only paths, or a custom
-builder command. `build_args` appends project-specific `-D` options. A private
-install prefix keeps the watched server executable independent from the outer
-`zig build run` artifact.
+builder command. A private install prefix keeps the watched server executable
+independent from the outer `zig build run` artifact.
 
 ### Replacement behavior
 
@@ -136,8 +134,8 @@ install prefix keeps the watched server executable independent from the outer
 
 SIGINT, SIGTERM, and Windows console shutdown request supervisor termination.
 Both builder and server children are stopped and joined before `run` returns
-`0`. POSIX children receive SIGTERM and are force-killed after
-`shutdown_grace_ms`; Windows children are terminated immediately.
+`0`. POSIX children receive SIGTERM and are force-killed after one second;
+Windows children are terminated immediately.
 
 The supervisor never calls `std.process.exit`.
 
@@ -163,6 +161,6 @@ The project must keep tests for:
 - writer-buffer precedence;
 - manual HTML content types;
 - written, chunked, encoded, and non-HTML pass-through;
-- supervisor option validation, child marker, and shutdown state;
+- supervisor child marker and shutdown state;
 - Debug and ReleaseSafe builds;
 - the one-command example using the installed executable.

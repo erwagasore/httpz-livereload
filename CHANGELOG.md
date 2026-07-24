@@ -5,7 +5,7 @@
 ### Breaking Changes
 
 - Replace SSE/EventSource transport with a no-store version endpoint and browser polling. `Config.retry_ms` is replaced by `Config.poll_interval_ms`, and the middleware no longer owns detached threads or requires `deinit` synchronization.
-- Replace configurable supervisor path policies with `Supervisor.run(init, options, child_main)`, requiring only `executable_name`. Remove `Rebuild`, `rebuild`, `restart_paths`, `debounce_ms`, and the public child-marker check.
+- Replace configurable supervisor path policies with `Supervisor.run(init, options, child_main)`. The executable name is inferred, `build_args` is the only remaining option, and `Rebuild`, `rebuild`, `restart_paths`, `debounce_ms`, and the public child-marker check are removed.
 
 ### Features
 
@@ -17,7 +17,7 @@
 
 - Match httpz response serialization when injecting: honor writer-buffer precedence, append to writer output without duplicating it, recognize manual HTML content types, and skip written, chunked, or encoded responses.
 - Handle SIGINT, SIGTERM, and Windows console shutdown in the development supervisor, stopping and joining active builder and server children instead of orphaning them when only the parent receives the event.
-- Reject zero polling intervals and empty supervisor install prefixes instead of producing busy loops or invalid paths.
+- Reject zero middleware polling intervals instead of producing a browser busy loop.
 
 ## [1.0.1] — 2026-07-13
 
