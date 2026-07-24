@@ -1,21 +1,9 @@
 //! Browser reload middleware for httpz.
 //!
-//! Injects a small script into HTML responses that opens an SSE connection
-//! to the server. The connection is held open for the lifetime of the page.
-//! A reload is triggered in three situations:
-//!
-//! - **Reconnection** — the SSE connection only drops when the server
-//!   process dies. The browser reconnects, receives a new `init` event,
-//!   and reloads.
-//!
-//! - **Explicit signal** — calling `reload()` pushes an SSE `reload`
-//!   event to every connected browser (e.g. a separate static-file watcher
-//!   reports that content changed).
-//!
-//! Rebuilding and restarting an application is deliberately outside this
-//! middleware's scope. A development supervisor should own that process
-//! lifecycle; browsers reload when their EventSource reconnects to the newly
-//! started server.
+//! HTML responses receive a small polling client. The client compares the
+//! server's current version with the version embedded in the page and reloads
+//! when they differ. A new process starts with a random version; `reload()`
+//! increments it for in-process changes such as updated static files.
 
 const std = @import("std");
 const httpz = @import("httpz");
@@ -23,228 +11,137 @@ const httpz = @import("httpz");
 const log = std.log.scoped(.livereload);
 const LiveReload = @This();
 
-/// Process-neutral development supervision. This is separate from the httpz
-/// middleware lifecycle and never runs from `init`, `execute`, or `deinit`.
+/// Development process supervision. This is separate from the middleware
+/// lifecycle and delegates source watching and rebuilding to `zig build
+/// --watch install`.
 pub const Supervisor = @import("supervisor.zig");
 
-// ── Config ───────────────────────────────────────────────────────────────────
-
 pub const Config = struct {
-    /// SSE endpoint path.
+    /// Browser polling endpoint.
     path: []const u8 = "/_livereload",
 
-    /// Reconnection interval (milliseconds). Controls both the SSE
-    /// `retry:` directive and the client-side reconnect delay. Lower
-    /// values mean faster reload after a restart at the cost of a few
-    /// extra TCP attempts while the server is down (negligible on
-    /// localhost).
-    retry_ms: u16 = 50,
+    /// Delay between browser version checks.
+    poll_interval_ms: u16 = 500,
 
-    /// I/O implementation used for synchronization waits. Zig 0.16 applications should
-    /// usually pass `init.io` from `main(init: std.process.Init)`.
+    /// Used once during initialization to generate the process version.
     io: std.Io = std.Options.debug_io,
 };
 
-// ── State ────────────────────────────────────────────────────────────────────
-
-// Immutable after init. All slices live on the server arena.
+// Immutable after initialization. The path is owned by the server arena.
 path: []const u8,
-inject_snippet: []const u8,
-sse_init_msg: []const u8,
+poll_interval_ms: u16,
 
-// I/O implementation used by SSE synchronization waits.
-io: std.Io,
-stopping: std.atomic.Value(bool),
-
-// Mutable shared state guarded by mu.
-mu: std.Io.Mutex,
-cond: std.Io.Condition,
-generation: u64,
-active_sse: u64,
-
-// ── Init / deinit ────────────────────────────────────────────────────────────
+// A random initial value distinguishes server processes. In-process content
+// changes increment the same value.
+version: std.atomic.Value(u64),
 
 pub fn init(config: Config, mc: httpz.MiddlewareConfig) !LiveReload {
-    const arena = mc.arena;
+    if (config.poll_interval_ms == 0) return error.InvalidPollInterval;
 
-    const path = try arena.dupe(u8, config.path);
-
-    // Pre-format the injected script.
-    //
-    // On disconnect the EventSource error handler reconnects after
-    // retry_ms. On reconnect the server sends a fresh "init" event;
-    // if we already received one (ok==true), we know the server
-    // restarted, so we reload the page.
-    const inject_snippet = try std.fmt.allocPrint(arena,
-        \\<script>(function(){{if(window.__lr)return;window.__lr=true;
-        \\var ok=false,t,R={d};
-        \\function c(){{var s=new EventSource("{s}");
-        \\s.addEventListener("init",function(){{if(ok){{s.close();location.reload()}}ok=true}});
-        \\s.addEventListener("reload",function(){{s.close();location.reload()}});
-        \\s.addEventListener("error",function(){{s.close();clearTimeout(t);t=setTimeout(c,R)}})}}
-        \\c()}})()</script>
-    , .{ config.retry_ms, path });
-
-    // Pre-format the SSE init message with the configured retry interval.
-    const sse_init_msg = try std.fmt.allocPrint(
-        arena,
-        "retry:{d}\nevent:init\ndata:\n\n",
-        .{config.retry_ms},
-    );
+    var initial_version: u64 = undefined;
+    config.io.random(std.mem.asBytes(&initial_version));
 
     return .{
-        .path = path,
-        .inject_snippet = inject_snippet,
-        .sse_init_msg = sse_init_msg,
-        .io = config.io,
-        .stopping = std.atomic.Value(bool).init(false),
-        .mu = .init,
-        .cond = .init,
-        .generation = 0,
-        .active_sse = 0,
+        .path = try mc.arena.dupe(u8, config.path),
+        .poll_interval_ms = config.poll_interval_ms,
+        .version = .init(initial_version),
     };
 }
 
-pub fn deinit(self: *LiveReload) void {
-    self.stopping.store(true, .release);
-
-    // Wake SSE writers parked on the condition variable and wait for them
-    // to leave before httpz frees the middleware arena.
-    self.mu.lockUncancelable(self.io);
-    self.cond.broadcast(self.io);
-    while (self.active_sse > 0) {
-        self.cond.waitUncancelable(self.io, &self.mu);
-    }
-    self.mu.unlock(self.io);
-}
-
-// ── Public API ───────────────────────────────────────────────────────────────
-
-/// Signal all connected browsers to reload.
-///
-/// Use for cases that don't involve a server restart, e.g. a content
-/// file changed on disk and the running server already serves the new
-/// version.
+/// Signal browsers to reload after an in-process content change.
 pub fn reload(self: *LiveReload) void {
-    self.mu.lockUncancelable(self.io);
-    defer self.mu.unlock(self.io);
-    self.generation +%= 1;
-    self.cond.broadcast(self.io);
+    _ = self.version.fetchAdd(1, .monotonic);
 }
 
-/// Extract the concrete `*LiveReload` from a type-erased `httpz.Middleware`
-/// handle returned by `server.middleware()`.
-///
-/// ```zig
-/// const mw = try server.middleware(LiveReload, .{});
-/// const lr = LiveReload.from(mw);
-/// lr.reload(); // manual trigger
-/// ```
-pub fn from(mw: anytype) *LiveReload {
-    return @ptrCast(@alignCast(mw.ptr));
+/// Adapter for watcher APIs that accept `(?*anyopaque) void` callbacks.
+pub fn reloadCallback(context: ?*anyopaque) void {
+    const self: *LiveReload = @ptrCast(@alignCast(context.?));
+    self.reload();
 }
 
-// ── Middleware execute ────────────────────────────────────────────────────────
+/// Extract the concrete middleware from the handle returned by
+/// `server.middleware()`.
+pub fn from(middleware: anytype) *LiveReload {
+    return @ptrCast(@alignCast(middleware.ptr));
+}
 
-// Takes *LiveReload (not *const) because Mutex.lock and atomic.cmpxchgStrong
-// require mutable pointers in Zig. This is the standard pattern for middleware
-// with interior-mutable state — httpz dispatches through *M which satisfies this.
 pub fn execute(self: *LiveReload, req: *httpz.Request, res: *httpz.Response, executor: anytype) !void {
-    // SSE endpoint — respond and short-circuit.
     if (std.mem.eql(u8, req.url.path, self.path)) {
-        return self.serveSSE(res);
+        return self.serveVersion(res);
     }
 
-    // Normal path — run the handler chain, then inject if HTML.
     try executor.next();
 
-    if (res.content_type == .HTML) {
-        self.injectScript(res);
-    }
+    // Streaming and disowned responses have already touched the wire.
+    if (res.written or res.chunked) return;
+    if (!isHtml(res)) return;
+    if (headerValue(res, "content-encoding") != null) return;
+
+    self.injectScript(res);
 }
 
-// ── SSE ──────────────────────────────────────────────────────────────────────
-
-const sse_reload = "event:reload\ndata:\n\n";
-
-const SseContext = struct {
-    lr: *LiveReload,
-    io: std.Io,
-};
-
-fn serveSSE(self: *LiveReload, res: *httpz.Response) !void {
-    // Reserve the writer before httpz spawns it. Without this handshake,
-    // deinit could observe zero active writers and free the server arena while
-    // the newly spawned thread was still waiting to run.
-    try self.reserveSseWriter();
-    errdefer self.releaseSseWriter();
-    try res.startEventStream(SseContext{ .lr = self, .io = res.conn.io }, sseWriter);
+fn serveVersion(self: *const LiveReload, res: *httpz.Response) !void {
+    res.content_type = .TEXT;
+    res.header("Cache-Control", "no-store");
+    res.body = try std.fmt.allocPrint(
+        res.arena,
+        "{x}",
+        .{self.version.load(.monotonic)},
+    );
 }
 
-fn reserveSseWriter(self: *LiveReload) error{Stopping}!void {
-    self.mu.lockUncancelable(self.io);
-    defer self.mu.unlock(self.io);
-
-    if (self.stopping.load(.acquire)) return error.Stopping;
-    self.active_sse += 1;
-}
-
-fn releaseSseWriter(self: *LiveReload) void {
-    self.mu.lockUncancelable(self.io);
-    defer self.mu.unlock(self.io);
-
-    self.active_sse -= 1;
-    self.cond.broadcast(self.io);
-}
-
-/// Runs in an httpz-managed detached thread. `serveSSE` reserves this writer
-/// before spawning it, so deinit cannot miss a thread that has not started yet.
-fn sseWriter(ctx: SseContext, stream: std.Io.net.Stream) void {
-    const self = ctx.lr;
-    defer self.releaseSseWriter();
-
-    if (self.stopping.load(.acquire)) return;
-
-    var writer = stream.writer(ctx.io, &.{});
-    const w = &writer.interface;
-
-    w.writeAll(self.sse_init_msg) catch return;
-    w.flush() catch return;
-
-    // Park until a reload is signalled.
-    {
-        self.mu.lockUncancelable(self.io);
-        defer self.mu.unlock(self.io);
-        const gen = self.generation;
-        while (self.generation == gen and !self.stopping.load(.acquire)) {
-            self.cond.waitUncancelable(self.io, &self.mu);
-        }
-        if (self.stopping.load(.acquire)) return;
-    }
-
-    w.writeAll(sse_reload) catch return;
-    w.flush() catch {};
-}
-
-// ── Script injection ─────────────────────────────────────────────────────────
+const script_format =
+    \\<script>(function(){{if(window.__lr)return;window.__lr=true;
+    \\var v="{x}",u="{s}",d={d};
+    \\async function p(){{try{{var r=await fetch(u,{{cache:"no-store"}});
+    \\if(r.ok&&(await r.text())!==v){{location.reload();return}}}}catch(_){{}}
+    \\setTimeout(p,d)}}p()}})()</script>
+;
 
 fn injectScript(self: *const LiveReload, res: *httpz.Response) void {
-    if (res.body.len > 0) {
-        // Handler set body directly — allocate on the per-request arena.
-        res.body = std.fmt.allocPrint(
-            res.arena,
-            "{s}{s}",
-            .{ res.body, self.inject_snippet },
-        ) catch |err| {
-            log.warn("failed to inject livereload script: {}", .{err});
+    const args = .{ self.version.load(.monotonic), self.path, self.poll_interval_ms };
+    const script_len = std.fmt.count(script_format, args);
+    const writer = res.writer();
+
+    // This mirrors httpz.Response.write(): writer output wins when non-empty.
+    // Append directly instead of duplicating the potentially large buffered
+    // body. Reserving first prevents a partial script on allocation failure.
+    if (writer.buffered().len > 0) {
+        writer.ensureUnusedCapacity(script_len) catch |err| {
+            log.warn("failed to reserve livereload script space: {}", .{err});
             return;
         };
-    } else {
-        // Handler used the writer API — append there.
-        res.writer().writeAll(self.inject_snippet) catch |err| {
+        writer.print(script_format, args) catch |err| {
             log.warn("failed to inject livereload script: {}", .{err});
         };
+        return;
     }
+
+    const output_len = std.math.add(usize, res.body.len, script_len) catch {
+        log.warn("HTML response is too large for livereload injection", .{});
+        return;
+    };
+    const output = res.arena.alloc(u8, output_len) catch |err| {
+        log.warn("failed to inject livereload script: {}", .{err});
+        return;
+    };
+    @memcpy(output[0..res.body.len], res.body);
+    _ = std.fmt.bufPrint(output[res.body.len..], script_format, args) catch unreachable;
+    res.body = output;
+}
+
+fn isHtml(res: *const httpz.Response) bool {
+    if (res.content_type) |content_type| return content_type == .HTML;
+    const value = headerValue(res, "content-type") orelse return false;
+    return std.ascii.startsWithIgnoreCase(value, "text/html");
+}
+
+fn headerValue(res: *const httpz.Response, name: []const u8) ?[]const u8 {
+    var iterator = res.headers.iterator();
+    while (iterator.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.key, name)) return header.value;
+    }
+    return null;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -253,6 +150,7 @@ const testing = std.testing;
 
 const NoopExecutor = struct {
     called: bool = false,
+
     pub fn next(self: *NoopExecutor) !void {
         self.called = true;
     }
@@ -261,111 +159,153 @@ const NoopExecutor = struct {
 fn testInstance() LiveReload {
     return .{
         .path = "/_livereload",
-        .inject_snippet = "<script>lr()</script>",
-        .sse_init_msg = "retry:50\nevent:init\ndata:\n\n",
-        .io = std.Options.debug_io,
-        .stopping = std.atomic.Value(bool).init(false),
-        .mu = .init,
-        .cond = .init,
-        .generation = 0,
-        .active_sse = 0,
+        .poll_interval_ms = 500,
+        .version = .init(42),
     };
 }
 
-test "reload increments generation" {
-    var lr = testInstance();
-    try testing.expectEqual(@as(u64, 0), lr.generation);
-    lr.reload();
-    try testing.expectEqual(@as(u64, 1), lr.generation);
-    lr.reload();
-    try testing.expectEqual(@as(u64, 2), lr.generation);
+fn effectiveBody(res: *httpz.Response) []const u8 {
+    const buffered = res.writer().buffered();
+    return if (buffered.len > 0) buffered else res.body;
 }
 
-test "SSE writer reservation participates in teardown before thread startup" {
-    var lr = testInstance();
-
-    try lr.reserveSseWriter();
-    try testing.expectEqual(@as(u64, 1), lr.active_sse);
-
-    lr.releaseSseWriter();
-    try testing.expectEqual(@as(u64, 0), lr.active_sse);
-
-    lr.stopping.store(true, .release);
-    try testing.expectError(error.Stopping, lr.reserveSseWriter());
-    try testing.expectEqual(@as(u64, 0), lr.active_sse);
+test "reload increments version" {
+    var live_reload = testInstance();
+    try testing.expectEqual(@as(u64, 42), live_reload.version.load(.monotonic));
+    live_reload.reload();
+    try testing.expectEqual(@as(u64, 43), live_reload.version.load(.monotonic));
 }
 
-test "init: copies configured path onto server arena" {
+test "reloadCallback increments version" {
+    var live_reload = testInstance();
+    reloadCallback(&live_reload);
+    try testing.expectEqual(@as(u64, 43), live_reload.version.load(.monotonic));
+}
+
+test "init rejects a zero polling interval" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    var path_buf = [_]u8{ '/', '_', 'x' };
-    const lr = try LiveReload.init(.{
-        .path = path_buf[0..],
+    try testing.expectError(error.InvalidPollInterval, LiveReload.init(.{
+        .poll_interval_ms = 0,
     }, .{
+        .arena = arena.allocator(),
+        .allocator = testing.allocator,
+    }));
+}
+
+test "init copies configured path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var path = [_]u8{ '/', '_', 'x' };
+    const live_reload = try LiveReload.init(.{ .path = path[0..] }, .{
         .arena = arena.allocator(),
         .allocator = testing.allocator,
     });
 
-    path_buf[2] = 'y';
-    try testing.expectEqualStrings("/_x", lr.path);
+    path[2] = 'y';
+    try testing.expectEqualStrings("/_x", live_reload.path);
 }
 
-test "injectScript: appends to body" {
-    var lr = testInstance();
-    var ht = httpz.testing.init(.{});
-    defer ht.deinit();
+test "version endpoint returns current no-store version" {
+    var live_reload = testInstance();
+    var http_test = httpz.testing.init(.{});
+    defer http_test.deinit();
+    http_test.url("/_livereload");
 
-    ht.res.content_type = .HTML;
-    ht.res.body = "<html></html>";
+    var executor = NoopExecutor{};
+    try live_reload.execute(http_test.req, http_test.res, &executor);
 
-    lr.injectScript(ht.res);
-
-    try testing.expectEqualStrings("<html></html><script>lr()</script>", ht.res.body);
+    try testing.expect(!executor.called);
+    try testing.expectEqual(httpz.ContentType.TEXT, http_test.res.content_type.?);
+    try testing.expectEqualStrings("2a", http_test.res.body);
+    try testing.expectEqualStrings("no-store", headerValue(http_test.res, "cache-control").?);
 }
 
-test "injectScript: appends to writer when body is empty" {
-    var lr = testInstance();
-    var ht = httpz.testing.init(.{});
-    defer ht.deinit();
+test "HTML body receives polling script" {
+    var live_reload = testInstance();
+    var http_test = httpz.testing.init(.{});
+    defer http_test.deinit();
+    http_test.url("/");
+    http_test.res.content_type = .HTML;
+    http_test.res.body = "<h1>hello</h1>";
 
-    ht.res.content_type = .HTML;
-    try ht.res.writer().writeAll("<html></html>");
+    var executor = NoopExecutor{};
+    try live_reload.execute(http_test.req, http_test.res, &executor);
 
-    lr.injectScript(ht.res);
-
-    const buffered = ht.res.writer().buffered();
-    try testing.expectEqualStrings("<html></html><script>lr()</script>", buffered);
+    try testing.expect(executor.called);
+    try testing.expect(std.mem.startsWith(u8, http_test.res.body, "<h1>hello</h1><script>"));
+    try testing.expect(std.mem.indexOf(u8, http_test.res.body, "var v=\"2a\"") != null);
 }
 
-test "execute: non-HTML responses pass through" {
-    var lr = testInstance();
-    var ht = httpz.testing.init(.{});
-    defer ht.deinit();
-    ht.url("/");
+test "writer buffer takes precedence and receives injection in place" {
+    var live_reload = testInstance();
+    var http_test = httpz.testing.init(.{});
+    defer http_test.deinit();
+    http_test.url("/");
+    http_test.res.content_type = .HTML;
+    http_test.res.body = "ignored";
+    try http_test.res.writer().writeAll("<p>writer</p>");
 
-    ht.res.content_type = .JSON;
-    ht.res.body = "{\"ok\":true}";
+    var executor = NoopExecutor{};
+    try live_reload.execute(http_test.req, http_test.res, &executor);
 
-    var exec = NoopExecutor{};
-    try lr.execute(ht.req, ht.res, &exec);
-
-    try testing.expect(exec.called);
-    try testing.expectEqualStrings("{\"ok\":true}", ht.res.body);
+    try testing.expectEqualStrings("ignored", http_test.res.body);
+    try testing.expect(std.mem.startsWith(
+        u8,
+        http_test.res.writer().buffered(),
+        "<p>writer</p><script>",
+    ));
 }
 
-test "execute: HTML responses get script injected" {
-    var lr = testInstance();
-    var ht = httpz.testing.init(.{});
-    defer ht.deinit();
-    ht.url("/");
+test "manual HTML content type is recognized case-insensitively" {
+    var live_reload = testInstance();
+    var http_test = httpz.testing.init(.{});
+    defer http_test.deinit();
+    http_test.url("/");
+    http_test.res.header("Content-Type", "Text/HTML; charset=utf-8");
+    http_test.res.body = "<p>hello</p>";
 
-    ht.res.content_type = .HTML;
-    ht.res.body = "<h1>hi</h1>";
+    var executor = NoopExecutor{};
+    try live_reload.execute(http_test.req, http_test.res, &executor);
 
-    var exec = NoopExecutor{};
-    try lr.execute(ht.req, ht.res, &exec);
+    try testing.expect(std.mem.indexOf(u8, http_test.res.body, "<script>") != null);
+}
 
-    try testing.expect(exec.called);
-    try testing.expectEqualStrings("<h1>hi</h1><script>lr()</script>", ht.res.body);
+test "non-HTML responses pass through" {
+    var live_reload = testInstance();
+    var http_test = httpz.testing.init(.{});
+    defer http_test.deinit();
+    http_test.url("/");
+    http_test.res.content_type = .JSON;
+    http_test.res.body = "{\"ok\":true}";
+
+    var executor = NoopExecutor{};
+    try live_reload.execute(http_test.req, http_test.res, &executor);
+
+    try testing.expectEqualStrings("{\"ok\":true}", effectiveBody(http_test.res));
+}
+
+test "written chunked and encoded HTML responses pass through" {
+    const Case = enum { written, chunked, encoded };
+    inline for ([_]Case{ .written, .chunked, .encoded }) |case| {
+        var live_reload = testInstance();
+        var http_test = httpz.testing.init(.{});
+        defer http_test.deinit();
+        http_test.url("/");
+        http_test.res.content_type = .HTML;
+        http_test.res.body = "<p>hello</p>";
+
+        switch (case) {
+            .written => http_test.res.written = true,
+            .chunked => http_test.res.chunked = true,
+            .encoded => http_test.res.header("Content-Encoding", "gzip"),
+        }
+
+        var executor = NoopExecutor{};
+        try live_reload.execute(http_test.req, http_test.res, &executor);
+
+        try testing.expectEqualStrings("<p>hello</p>", effectiveBody(http_test.res));
+    }
 }

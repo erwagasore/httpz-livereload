@@ -29,8 +29,8 @@ Use [Conventional Commits](https://www.conventionalcommits.org/).
 ## Repo map
 
 - `SPEC.md` — implementation contract and subsystem boundaries
-- `src/root.zig` — the httpz middleware contract (SSE endpoint, script injection, reload API)
-- `src/supervisor.zig` — reusable development supervisor (watch, rebuild, restart child)
+- `src/root.zig` — the httpz middleware contract (version endpoint, script injection, reload API)
+- `src/supervisor.zig` — minimal development supervisor (persistent Zig builder, restart child)
 - `example/main.zig` — minimal httpz server demonstrating the middleware
 - `build.zig` — build script (library module, tests, example)
 - `build.zig.zon` — package manifest and dependency on httpz

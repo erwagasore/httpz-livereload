@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .httpz = .{
-            .url = "git+https://github.com/erwagasore/http.zig?ref=fix/listener-error-cleanup#aee1e4d0f6c7ff7abbb5dc29bd73cfd2cef36c1a",
+            .url = "https://github.com/karlseguin/http.zig/archive/52eb187cff75e168316b44480cd9f0fae26a1c5e.tar.gz",
             .hash = "httpz-0.0.0-PNVzrL3oCADwWVoScHt1fFGTRyZMJ_FYa9reFvHhqq8Y",
         },
     },
