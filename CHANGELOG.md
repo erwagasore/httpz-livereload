@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-08-04
+
 ### Features
 
 - Add optional supervisor `restart_paths` for immutable startup content: stable runtime create, modify, remove, and rename changes replace the child from the latest installed executable without requiring a rebuild.
