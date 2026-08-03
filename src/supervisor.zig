@@ -1,9 +1,9 @@
 //! Minimal development supervisor for `zig build run`.
 //!
 //! Zig owns source watching, debouncing, incremental compilation, and install
-//! semantics through `zig build --watch install`. This supervisor watches only
-//! the installed executable and replaces the server after that executable has
-//! changed and remained stable for one polling interval.
+//! semantics through `zig build --watch install`. The supervisor also supports
+//! optional runtime paths whose stable changes replace the child from the last
+//! successfully installed executable without requiring a rebuild.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -15,9 +15,15 @@ const default_install_prefix = ".zig-cache/httpz-livereload/install";
 const default_poll_interval_ms: u32 = 100;
 const default_shutdown_grace_ms: u32 = 1_000;
 
-/// Additional options passed to `zig build --watch install`.
+/// Development-supervisor policy.
 pub const Options = struct {
+    /// Additional options passed to `zig build --watch install`.
     build_args: []const []const u8 = &.{},
+
+    /// Files or directories, relative to the process working directory, whose
+    /// stable changes replace the child without requiring a rebuilt executable.
+    /// Intended for immutable startup snapshots such as authored content.
+    restart_paths: []const []const u8 = &.{},
 };
 
 const Config = struct {
@@ -28,6 +34,7 @@ const Config = struct {
     executable_path: []const u8,
     child_args: []const []const u8,
     builder_argv: []const []const u8,
+    restart_paths: []const []const u8,
 };
 
 /// Run `child_main` directly in marked server children; otherwise enter the
@@ -84,6 +91,7 @@ pub fn run(
         .executable_path = executable_path,
         .child_args = child_args,
         .builder_argv = builder_argv.items,
+        .restart_paths = options.restart_paths,
     });
 }
 
@@ -119,7 +127,10 @@ fn supervise(config: Config) !u8 {
             else => return err,
         };
     };
-    var pending: ?u64 = null;
+    var pending_installed: ?u64 = null;
+    var runtime_paths = try runtimePathsFingerprint(config);
+    var pending_runtime_paths: ?u64 = null;
+    var runtime_restart_ready = false;
     var generation: u64 = 0;
 
     replacement: while (true) : (generation +%= 1) {
@@ -172,27 +183,43 @@ fn supervise(config: Config) !u8 {
                 .awake,
             );
 
-            const current = executableFingerprint(config) catch |err| switch (err) {
+            const current_installed = executableFingerprint(config) catch |err| switch (err) {
                 // Atomic installation can make the destination briefly absent on
                 // some filesystems. Keep serving and inspect it again next tick.
                 error.FileNotFound => continue,
                 else => return err,
             };
+            const installed_ready = observeStableChange(
+                current_installed,
+                &installed,
+                &pending_installed,
+            );
 
-            if (current == installed) {
-                pending = null;
-                continue;
-            }
+            const current_runtime_paths = try runtimePathsFingerprint(config);
+            if (observeStableChange(
+                current_runtime_paths,
+                &runtime_paths,
+                &pending_runtime_paths,
+            )) runtime_restart_ready = true;
 
-            if (pending == current) {
-                installed = current;
-                pending = null;
-                log.info("installed executable changed; restarting server", .{});
+            // If an executable replacement is still stabilizing, wait so one
+            // replacement uses the newest stable installed generation.
+            if (installed_ready or (runtime_restart_ready and pending_installed == null)) {
+                if (installed_ready and runtime_restart_ready) {
+                    log.info("installed executable and runtime content changed; restarting server", .{});
+                } else if (installed_ready) {
+                    log.info("installed executable changed; restarting server", .{});
+                } else {
+                    log.info("runtime content changed; restarting server", .{});
+                }
+                // The replacement itself establishes both observed generations,
+                // including a runtime change seen once alongside a stable build.
+                runtime_paths = current_runtime_paths;
+                pending_runtime_paths = null;
+                runtime_restart_ready = false;
                 server.stop(config);
                 continue :replacement;
             }
-
-            pending = current;
         }
     }
 }
@@ -213,6 +240,104 @@ fn statFingerprint(stat: std.Io.File.Stat) u64 {
     hash.update(std.mem.asBytes(&stat.size));
     hash.update(std.mem.asBytes(&mtime));
     hash.update(std.mem.asBytes(&ctime));
+    return hash.final();
+}
+
+/// Require one repeated observation before accepting a changed generation.
+fn observeStableChange(current: u64, stable: *u64, pending: *?u64) bool {
+    if (current == stable.*) {
+        pending.* = null;
+        return false;
+    }
+    if (pending.* == current) {
+        stable.* = current;
+        pending.* = null;
+        return true;
+    }
+    pending.* = current;
+    return false;
+}
+
+/// Deterministic fingerprint of configured runtime files and directory trees.
+/// Directory iteration order is normalized by sorting per-entry fingerprints.
+fn runtimePathsFingerprint(config: Config) !u64 {
+    if (config.restart_paths.len == 0) return 0;
+
+    var parts: std.ArrayList(u64) = .empty;
+    defer parts.deinit(config.allocator);
+
+    for (config.restart_paths) |root_path| {
+        const root_stat = config.cwd.statFile(config.io, root_path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                try parts.append(config.allocator, missingPathFingerprint(root_path));
+                continue;
+            },
+            else => return err,
+        };
+        try parts.append(
+            config.allocator,
+            pathStatFingerprint(root_path, "", root_stat.kind, root_stat),
+        );
+        if (root_stat.kind != .directory) continue;
+
+        var dir = config.cwd.openDir(config.io, root_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                try parts.append(config.allocator, missingPathFingerprint(root_path));
+                continue;
+            },
+            else => return err,
+        };
+        defer dir.close(config.io);
+        var walker = try dir.walk(config.allocator);
+        defer walker.deinit();
+
+        while (try walker.next(config.io)) |entry| {
+            const stat = entry.dir.statFile(config.io, entry.basename, .{}) catch |err| switch (err) {
+                // A concurrent rename will be observed in its settled form on a
+                // later poll; record the path transition without ending supervision.
+                error.FileNotFound, error.NotDir => {
+                    try parts.append(
+                        config.allocator,
+                        missingPathFingerprint(entry.path),
+                    );
+                    continue;
+                },
+                else => return err,
+            };
+            try parts.append(
+                config.allocator,
+                pathStatFingerprint(root_path, entry.path, entry.kind, stat),
+            );
+        }
+    }
+
+    std.sort.heap(u64, parts.items, {}, std.sort.asc(u64));
+    var hash = std.hash.Wyhash.init(0);
+    for (parts.items) |part| hash.update(std.mem.asBytes(&part));
+    return hash.final();
+}
+
+fn pathStatFingerprint(
+    root_path: []const u8,
+    relative_path: []const u8,
+    kind: std.Io.File.Kind,
+    stat: std.Io.File.Stat,
+) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(root_path);
+    hash.update(&.{0});
+    hash.update(relative_path);
+    hash.update(&.{0});
+    hash.update(@tagName(kind));
+    const fingerprint = statFingerprint(stat);
+    hash.update(std.mem.asBytes(&fingerprint));
+    return hash.final();
+}
+
+fn missingPathFingerprint(path: []const u8) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(path);
+    hash.update("\x00missing");
     return hash.final();
 }
 
@@ -487,6 +612,81 @@ test "isChild accepts only the supervisor marker" {
     try testing.expect(!isChild(&env));
     try env.put(child_marker, "1");
     try testing.expect(isChild(&env));
+}
+
+test "observeStableChange accepts only a repeated changed generation" {
+    var stable: u64 = 1;
+    var pending: ?u64 = null;
+
+    try testing.expect(!observeStableChange(1, &stable, &pending));
+    try testing.expect(!observeStableChange(2, &stable, &pending));
+    try testing.expectEqual(@as(?u64, 2), pending);
+    try testing.expect(observeStableChange(2, &stable, &pending));
+    try testing.expectEqual(@as(u64, 2), stable);
+    try testing.expectEqual(@as(?u64, null), pending);
+
+    try testing.expect(!observeStableChange(3, &stable, &pending));
+    try testing.expect(!observeStableChange(2, &stable, &pending));
+    try testing.expectEqual(@as(?u64, null), pending);
+}
+
+test "runtime path fingerprint detects create modify rename and remove" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "content", .default_dir);
+
+    const config: Config = .{
+        .allocator = testing.allocator,
+        .io = io,
+        .cwd = tmp.dir,
+        .env = undefined,
+        .executable_path = "",
+        .child_args = &.{},
+        .builder_argv = &.{},
+        .restart_paths = &.{"content"},
+    };
+
+    const empty = try runtimePathsFingerprint(config);
+    try testing.expectEqual(empty, try runtimePathsFingerprint(config));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "content/one.md", .data = "one" });
+    const created = try runtimePathsFingerprint(config);
+    try testing.expect(created != empty);
+    try testing.expectEqual(created, try runtimePathsFingerprint(config));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "content/one.md", .data = "changed content" });
+    const modified = try runtimePathsFingerprint(config);
+    try testing.expect(modified != created);
+
+    try tmp.dir.rename("content/one.md", tmp.dir, "content/two.md", io);
+    const renamed = try runtimePathsFingerprint(config);
+    try testing.expect(renamed != modified);
+
+    try tmp.dir.deleteFile(io, "content/two.md");
+    const removed = try runtimePathsFingerprint(config);
+    try testing.expect(removed != renamed);
+}
+
+test "runtime path fingerprint tracks a path created after supervision starts" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config: Config = .{
+        .allocator = testing.allocator,
+        .io = io,
+        .cwd = tmp.dir,
+        .env = undefined,
+        .executable_path = "",
+        .child_args = &.{},
+        .builder_argv = &.{},
+        .restart_paths = &.{"content"},
+    };
+
+    const missing = try runtimePathsFingerprint(config);
+    try tmp.dir.createDir(io, "content", .default_dir);
+    const created = try runtimePathsFingerprint(config);
+    try testing.expect(created != missing);
 }
 
 test "Shutdown records requests and rejects overlap" {

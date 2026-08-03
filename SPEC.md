@@ -10,8 +10,9 @@ The package exposes two independent facilities:
 1. `LiveReload` — an httpz middleware that injects a polling client, serves a
    version endpoint, and exposes an in-process reload signal.
 2. `LiveReload.Supervisor` — an optional parent process that delegates source
-   watching and rebuilding to `zig build --watch install` and replaces the
-   server when the installed executable changes.
+   watching and rebuilding to `zig build --watch install`, polls explicitly
+   configured immutable runtime paths, and replaces the server when either the
+   installed executable or a runtime-content generation changes.
 
 Mounting the middleware never starts watchers, builders, threads, or child
 processes.
@@ -72,8 +73,10 @@ The livereload middleware never watches files.
 - Static middleware owns static roots, cache invalidation, and static change
   detection.
 - Content subsystems own their source trees and parsed state.
-- After making changed runtime content available, an owning subsystem may call
-  `LiveReload.reload()`.
+- After making changed mutable runtime content available in-process, an owning
+  subsystem may call `LiveReload.reload()`.
+- An immutable startup subsystem may instead configure its source tree as a
+  supervisor `restart_path`; the new child remains responsible for loading it.
 - There is one authoritative watcher per filesystem tree.
 
 ## Minimal supervisor contract
@@ -89,8 +92,10 @@ return LiveReload.Supervisor.run(init, .{}, runHttpServer);
 `std.process.Init` supplies the allocator, I/O implementation, environment,
 parent command-line arguments, and running executable name. Normal
 `installArtifact` and `addRunArtifact` build integration remains supported.
-`build_args` is the only policy option and appends project-specific `-D` values
-to the persistent builder.
+`build_args` appends project-specific `-D` values to the persistent builder.
+`restart_paths` lists files or directories relative to the process working
+folder whose stable changes replace the child without requiring a rebuild.
+An empty list preserves the executable-only behavior and polling cost.
 
 ### Builder ownership
 
@@ -109,16 +114,22 @@ Zig's build runner owns:
 - recovery after failed builds;
 - installation after successful builds.
 
-The supervisor does not accept rebuild paths, restart-only paths, or a custom
-builder command. A private install prefix keeps the watched server executable
-independent from the outer `zig build run` artifact.
+The supervisor does not accept custom rebuild paths or a custom builder
+command. A private install prefix keeps the watched server executable
+independent from the outer `zig build run` artifact. Runtime restart paths are
+separate from Zig's build graph: they never invoke or gate the builder.
 
 ### Replacement behavior
 
 - The supervisor waits for the first successful private installation, then
   starts the server.
-- The supervisor fingerprints only that executable.
+- The supervisor fingerprints the executable and each configured runtime file
+  or directory tree; directory-entry order is normalized.
 - A changed fingerprint must remain stable for one polling interval.
+- Runtime create, modify, remove, and rename operations replace the child from
+  the last stable installed executable without requiring a rebuilt artifact.
+- Overlapping executable/runtime changes coalesce so replacement uses the newest
+  stable executable generation.
 - After a stable change, the old server is stopped and joined before the new
   server starts.
 - A failed build leaves the installed executable unchanged, so the current
@@ -145,7 +156,7 @@ The package does not provide:
 
 - SSE or persistent browser connections;
 - file or directory watching in the middleware;
-- custom rebuild/restart path classification;
+- custom rebuild path classification;
 - content parsing or static serving;
 - framework-specific HMR;
 - browser build-error overlays;
@@ -162,5 +173,6 @@ The project must keep tests for:
 - manual HTML content types;
 - written, chunked, encoded, and non-HTML pass-through;
 - supervisor child marker and shutdown state;
+- runtime path generation fingerprints and stable-change debounce;
 - Debug and ReleaseSafe builds;
 - the one-command example using the installed executable.
