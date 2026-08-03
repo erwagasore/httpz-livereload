@@ -83,14 +83,30 @@ zig build run
 ```
 
 Zig owns source discovery, filesystem notifications, debouncing, incremental
-compilation, and retries after failed builds. The supervisor watches only the
-installed executable:
+compilation, and retries after failed builds. By default the supervisor watches
+only the installed executable:
 
 - successful install → stop and replace the server;
 - failed build → installed executable remains unchanged and the old server keeps
   serving;
-- static/runtime file change → owning subsystem calls `reload()` without a
-  restart.
+- mutable static/runtime file change → owning subsystem updates its in-process
+  state and calls `reload()` without a restart.
+
+Applications that load immutable runtime content only at startup can configure
+restart paths. A stable create, modify, remove, or rename below those paths
+replaces the child from the last successfully installed executable without
+requiring a rebuild:
+
+```zig
+return LiveReload.Supervisor.run(init, .{
+    .restart_paths = &.{"content"},
+}, runHttpServer);
+```
+
+The supervisor owns polling, debounce, and child replacement; the new child
+owns parsing/loading the fresh content generation. Runtime and executable
+changes that overlap are coalesced into one replacement using the newest stable
+installed executable.
 
 The private install prefix keeps the rebuilt server independent from the outer
 `zig build run` artifact. On Windows, the supervisor additionally runs
@@ -113,8 +129,10 @@ return LiveReload.Supervisor.run(init, .{
 }, runHttpServer);
 ```
 
-The executable name, builder command, private install prefix, polling interval,
-and shutdown policy are derived or fixed internally. Command-line arguments are
+`build_args` affect only Zig's persistent builder. `restart_paths` are relative
+to the supervised working directory and affect only child replacement. The
+executable name, builder command, private install prefix, polling interval, and
+shutdown policy are derived or fixed internally. Command-line arguments are
 forwarded to the server. SIGINT, SIGTERM, and Windows console shutdown stop and
 join both children; POSIX shutdown escalates from SIGTERM to SIGKILL after one
 second.
